@@ -133,11 +133,8 @@ impl Config {
             .map(|w| w.trim().to_string())
             .filter(|w| !w.is_empty())
             .ok_or("WALLET is required (your BTC payout address)")?;
-        if payout_address.len() < 26 {
-            return Err(format!(
-                "WALLET looks invalid (too short): {payout_address:?}"
-            ));
-        }
+        crate::bitcoin_address::validate(&payout_address, network)
+            .map_err(|e| format!("WALLET is not a valid payout address: {e}"))?;
 
         let worker_name = get("WORKER_NAME").unwrap_or_else(|| "miner".into());
 
@@ -149,7 +146,6 @@ impl Config {
                 }
                 trimmed
             }
-            None if payout_address.contains('.') => payout_address.clone(),
             None => format!("{payout_address}.{worker_name}"),
         };
 
@@ -252,7 +248,8 @@ mod tests {
         Config::from_vars(|k| map.get(k).cloned())
     }
 
-    const WALLET: (&str, &str) = ("WALLET", "bc1qexamplewalletaddress0000000000");
+    const WALLET: (&str, &str) = ("WALLET", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+    const TESTNET_WALLET: (&str, &str) = ("WALLET", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx");
 
     #[test]
     fn wallet_is_required() {
@@ -262,13 +259,26 @@ mod tests {
 
     #[test]
     fn wallet_is_trimmed() {
-        let c = cfg(&[("WALLET", "  bc1qexamplewalletaddress0000000000  ")]).unwrap();
-        assert_eq!(c.payout_address, "bc1qexamplewalletaddress0000000000");
+        let c = cfg(&[("WALLET", "  bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4  ")]).unwrap();
+        assert_eq!(
+            c.payout_address,
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        );
     }
 
     #[test]
     fn short_wallet_is_rejected() {
         assert!(cfg(&[("WALLET", "bc1qshort")]).is_err());
+    }
+
+    #[test]
+    fn invalid_wallet_checksum_is_rejected() {
+        assert!(cfg(&[("WALLET", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5")]).is_err());
+    }
+
+    #[test]
+    fn mainnet_wallet_rejected_when_network_is_testnet() {
+        assert!(cfg(&[WALLET, ("NETWORK", "testnet")]).is_err());
     }
 
     #[test]
@@ -308,13 +318,10 @@ mod tests {
     #[test]
     fn pool_username_appends_worker_name() {
         let c = cfg(&[WALLET, ("WORKER_NAME", "vps1")]).unwrap();
-        assert_eq!(c.pool_username, "bc1qexamplewalletaddress0000000000.vps1");
-    }
-
-    #[test]
-    fn pool_username_keeps_wallet_with_embedded_worker() {
-        let c = cfg(&[("WALLET", "bc1qexamplewalletaddress0000000000.rig")]).unwrap();
-        assert_eq!(c.pool_username, "bc1qexamplewalletaddress0000000000.rig");
+        assert_eq!(
+            c.pool_username,
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.vps1"
+        );
     }
 
     #[test]
@@ -353,7 +360,7 @@ mod tests {
 
     #[test]
     fn network_accepts_testnet() {
-        let c = cfg(&[WALLET, ("NETWORK", "testnet")]).unwrap();
+        let c = cfg(&[TESTNET_WALLET, ("NETWORK", "testnet")]).unwrap();
         assert_eq!(c.network, BitcoinNetwork::Testnet);
     }
 
@@ -410,7 +417,7 @@ mod tests {
                 "-o",
                 "stratum+tcp://public-pool.io:21496",
                 "-u",
-                "bc1qexamplewalletaddress0000000000.miner",
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.miner",
                 "-p",
                 "x",
                 "-t",
@@ -435,7 +442,7 @@ mod tests {
                 "--url",
                 "stratum+tcp://public-pool.io:21496",
                 "--user",
-                "bc1qexamplewalletaddress0000000000.miner",
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.miner",
                 "--threads",
                 "4",
                 "--gpu",

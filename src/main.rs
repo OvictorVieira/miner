@@ -1,4 +1,5 @@
 mod auth;
+mod bitcoin_address;
 mod config;
 mod cpuminer_policy;
 mod dockerfile_policy;
