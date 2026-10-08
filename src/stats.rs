@@ -141,7 +141,9 @@ impl StatsCache {
     }
 
     async fn fetch_pool(&self, wallet: &str) -> Option<PoolStats> {
-        let v = self.fetch_json(format!("{POOL_API}/client/{wallet}")).await?;
+        let v = self
+            .fetch_json(format!("{POOL_API}/client/{wallet}"))
+            .await?;
         Some(parse_pool_stats(&v))
     }
 

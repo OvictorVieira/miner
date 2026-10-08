@@ -35,7 +35,9 @@ impl Config {
                 .parse::<u8>()
                 .ok()
                 .filter(|p| (1..=100).contains(p))
-                .ok_or(format!("POWER must be an integer from 1 to 100, got {raw:?}"))?,
+                .ok_or(format!(
+                    "POWER must be an integer from 1 to 100, got {raw:?}"
+                ))?,
         };
 
         let port = match get("PORT") {
@@ -89,11 +91,16 @@ impl Config {
                 })
                 .collect(),
             None => vec![
-                "-a".into(), "sha256d".into(),
-                "-o".into(), self.pool_url.clone(),
-                "-u".into(), self.stratum_user(),
-                "-p".into(), "x".into(),
-                "-t".into(), threads.to_string(),
+                "-a".into(),
+                "sha256d".into(),
+                "-o".into(),
+                self.pool_url.clone(),
+                "-u".into(),
+                self.stratum_user(),
+                "-p".into(),
+                "x".into(),
+                "-t".into(),
+                threads.to_string(),
             ],
         }
     }
@@ -139,7 +146,10 @@ mod tests {
     #[test]
     fn power_out_of_range_is_rejected() {
         for bad in ["0", "101", "150", "abc", "-5", ""] {
-            assert!(cfg(&[WALLET, ("POWER", bad)]).is_err(), "POWER={bad:?} should fail");
+            assert!(
+                cfg(&[WALLET, ("POWER", bad)]).is_err(),
+                "POWER={bad:?} should fail"
+            );
         }
     }
 
@@ -180,11 +190,16 @@ mod tests {
         assert_eq!(
             c.miner_command_args(2),
             vec![
-                "-a", "sha256d",
-                "-o", "stratum+tcp://public-pool.io:21496",
-                "-u", "bc1qexamplewalletaddress0000000000.miner",
-                "-p", "x",
-                "-t", "2",
+                "-a",
+                "sha256d",
+                "-o",
+                "stratum+tcp://public-pool.io:21496",
+                "-u",
+                "bc1qexamplewalletaddress0000000000.miner",
+                "-p",
+                "x",
+                "-t",
+                "2",
             ]
         );
     }
@@ -193,16 +208,23 @@ mod tests {
     fn custom_miner_args_substitute_placeholders() {
         let c = cfg(&[
             WALLET,
-            ("MINER_ARGS", "--url {POOL} --user {USER} --threads {THREADS} --gpu 0"),
+            (
+                "MINER_ARGS",
+                "--url {POOL} --user {USER} --threads {THREADS} --gpu 0",
+            ),
         ])
         .unwrap();
         assert_eq!(
             c.miner_command_args(4),
             vec![
-                "--url", "stratum+tcp://public-pool.io:21496",
-                "--user", "bc1qexamplewalletaddress0000000000.miner",
-                "--threads", "4",
-                "--gpu", "0",
+                "--url",
+                "stratum+tcp://public-pool.io:21496",
+                "--user",
+                "bc1qexamplewalletaddress0000000000.miner",
+                "--threads",
+                "4",
+                "--gpu",
+                "0",
             ]
         );
     }
