@@ -24,14 +24,24 @@ Check your worker at `https://web.public-pool.io/#/app/YOUR_WALLET`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `WALLET` | — | **Required.** Your BTC address (receives the reward if you ever find a block) |
+| `WALLET` | — | **Required.** Your BTC payout address (receives the reward if you ever find a block) |
 | `POWER` | `50` | % of CPU cores used by the miner (1-100) |
 | `WORKER_NAME` | `miner` | Worker name shown at the pool (useful with multiple instances) |
-| `POOL_URL` | `stratum+tcp://public-pool.io:21496` | Solo pool (stratum) |
 | `PORT` | `3500` | Dashboard port |
 | `DASHBOARD_PASSWORD` | — | Dashboard password; without it the panel is public read-only |
 | `MINER_BIN` | `/usr/local/bin/minerd` | Miner binary |
 | `MINER_ARGS` | — | Custom miner arguments (see below) |
+
+### Advanced (typed, validated; defaults are correct for almost everyone)
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODE` | `solo` | Mining topology. Only `solo` is implemented; `shared` is rejected with an explicit error |
+| `NETWORK` | `mainnet` | Bitcoin network the payout address belongs to (`mainnet` or `testnet`) |
+| `POOL_URL` | `stratum+tcp://public-pool.io:21496` | Solo pool endpoint (stratum). Overriding this is an advanced, mostly-unvalidated knob |
+| `POOL_USERNAME` | `<WALLET>.<WORKER_NAME>` | Override the Stratum username sent to the pool instead of the computed default |
+| `SECRET_FILE` | — | Path to a file holding a pool secret; reserved for shared-pool authentication, unused by `MODE=solo` |
+| `TLS_POLICY` | `plaintext` | Stratum transport policy. `required` is rejected: the bundled cpuminer engine has no TLS support |
 
 To cap resource usage beyond `POWER`, use Docker's own CPU limit
 (`cpus: "2.0"` in compose).

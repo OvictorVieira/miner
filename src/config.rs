@@ -1,10 +1,90 @@
 use std::cmp::max;
+use std::path::Path;
+
+/// Fixed MVP pool endpoint. `POOL_URL` can still override it; full syntax
+/// validation of that override is added by US-071 and the override remains
+/// an advanced, undocumented-for-beginners knob until then.
+const DEFAULT_POOL_URL: &str = "stratum+tcp://public-pool.io:21496";
+
+/// Mining topology. Only `Solo` is implemented in this MVP; `Shared` is
+/// modeled now so a future pool-account flow has a typed home, but selecting
+/// it today is an explicit, documented error rather than a silent fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiningMode {
+    Solo,
+    Shared,
+}
+
+impl MiningMode {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "solo" => Ok(MiningMode::Solo),
+            "shared" => Ok(MiningMode::Shared),
+            other => Err(format!("MODE must be 'solo' or 'shared', got {other:?}")),
+        }
+    }
+}
+
+/// Bitcoin network the payout address belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitcoinNetwork {
+    Mainnet,
+    Testnet,
+}
+
+impl BitcoinNetwork {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "mainnet" => Ok(BitcoinNetwork::Mainnet),
+            "testnet" => Ok(BitcoinNetwork::Testnet),
+            other => Err(format!(
+                "NETWORK must be 'mainnet' or 'testnet', got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Transport policy for the Stratum connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsPolicy {
+    /// The bundled cpuminer engine speaks plaintext Stratum only (see
+    /// SECURITY.md). This is the only policy this MVP can actually honor.
+    PlaintextAllowed,
+    Required,
+}
+
+impl TlsPolicy {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "plaintext" => Ok(TlsPolicy::PlaintextAllowed),
+            "required" => Ok(TlsPolicy::Required),
+            other => Err(format!(
+                "TLS_POLICY must be 'plaintext' or 'required', got {other:?}"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub wallet: String,
-    pub pool_url: String,
+    // Validated at load time; consumed once MODE=shared ships (currently rejected above).
+    #[allow(dead_code)]
+    pub mode: MiningMode,
+    // Validated at load time; consumed by payout address validation (US-008).
+    #[allow(dead_code)]
+    pub network: BitcoinNetwork,
+    pub payout_address: String,
+    pub pool_username: String,
+    // Folded into `pool_username` at load time; kept for display/logging use.
+    #[allow(dead_code)]
     pub worker_name: String,
+    // Reserved for shared-pool authentication once MODE=shared ships.
+    #[allow(dead_code)]
+    pub secret_file: Option<String>,
+    pub pool_url: String,
+    // Validated at load time; consumed once TLS_POLICY=required ships.
+    #[allow(dead_code)]
+    pub tls_policy: TlsPolicy,
     pub power: u8,
     pub port: u16,
     pub miner_bin: String,
@@ -20,13 +100,71 @@ impl Config {
     }
 
     fn from_vars<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
-        let wallet = get("WALLET")
+        let mode = match get("MODE") {
+            None => MiningMode::Solo,
+            Some(raw) => MiningMode::parse(&raw)?,
+        };
+        if mode == MiningMode::Shared {
+            return Err(
+                "MODE=shared is not implemented in this MVP; only solo mining against the \
+                 fixed pool endpoint is supported. Set MODE=solo or omit it."
+                    .into(),
+            );
+        }
+
+        let network = match get("NETWORK") {
+            None => BitcoinNetwork::Mainnet,
+            Some(raw) => BitcoinNetwork::parse(&raw)?,
+        };
+
+        let tls_policy = match get("TLS_POLICY") {
+            None => TlsPolicy::PlaintextAllowed,
+            Some(raw) => TlsPolicy::parse(&raw)?,
+        };
+        if tls_policy == TlsPolicy::Required {
+            return Err(
+                "TLS_POLICY=required is not supported: the bundled cpuminer engine has no TLS \
+                 support in this MVP (see SECURITY.md). Use TLS_POLICY=plaintext or omit it."
+                    .into(),
+            );
+        }
+
+        let payout_address = get("WALLET")
             .map(|w| w.trim().to_string())
             .filter(|w| !w.is_empty())
-            .ok_or("WALLET is required (your BTC address)")?;
-        if wallet.len() < 26 {
-            return Err(format!("WALLET looks invalid (too short): {wallet:?}"));
+            .ok_or("WALLET is required (your BTC payout address)")?;
+        if payout_address.len() < 26 {
+            return Err(format!(
+                "WALLET looks invalid (too short): {payout_address:?}"
+            ));
         }
+
+        let worker_name = get("WORKER_NAME").unwrap_or_else(|| "miner".into());
+
+        let pool_username = match get("POOL_USERNAME") {
+            Some(raw) => {
+                let trimmed = raw.trim().to_string();
+                if trimmed.is_empty() {
+                    return Err("POOL_USERNAME, when set, cannot be empty".into());
+                }
+                trimmed
+            }
+            None if payout_address.contains('.') => payout_address.clone(),
+            None => format!("{payout_address}.{worker_name}"),
+        };
+
+        let secret_file = match get("SECRET_FILE") {
+            Some(raw) => {
+                let path = raw.trim().to_string();
+                if !Path::new(&path).is_file() {
+                    return Err(format!(
+                        "SECRET_FILE does not point to a readable file: {path:?}"
+                    ));
+                }
+                Some(path)
+            }
+            None => None,
+        };
 
         let power = match get("POWER") {
             None => 50,
@@ -49,10 +187,14 @@ impl Config {
         };
 
         Ok(Config {
-            wallet,
-            pool_url: get("POOL_URL")
-                .unwrap_or_else(|| "stratum+tcp://public-pool.io:21496".into()),
-            worker_name: get("WORKER_NAME").unwrap_or_else(|| "miner".into()),
+            mode,
+            network,
+            payout_address,
+            pool_username,
+            worker_name,
+            secret_file,
+            pool_url: get("POOL_URL").unwrap_or_else(|| DEFAULT_POOL_URL.into()),
+            tls_policy,
             power,
             port,
             miner_bin: get("MINER_BIN").unwrap_or_else(|| "/usr/local/bin/minerd".into()),
@@ -66,15 +208,6 @@ impl Config {
         max(1, cores * self.power as usize / 100)
     }
 
-    /// Stratum username: `wallet.worker`, unless the wallet already embeds a worker name.
-    pub fn stratum_user(&self) -> String {
-        if self.wallet.contains('.') {
-            self.wallet.clone()
-        } else {
-            format!("{}.{}", self.wallet, self.worker_name)
-        }
-    }
-
     /// Arguments for the miner process. With MINER_ARGS set, the engine is
     /// fully pluggable (GPU miners, other algos): each token has {POOL},
     /// {USER} and {THREADS} substituted. Otherwise, defaults to cpuminer
@@ -86,7 +219,7 @@ impl Config {
                 .map(|token| {
                     token
                         .replace("{POOL}", &self.pool_url)
-                        .replace("{USER}", &self.stratum_user())
+                        .replace("{USER}", &self.pool_username)
                         .replace("{THREADS}", &threads.to_string())
                 })
                 .collect(),
@@ -96,7 +229,7 @@ impl Config {
                 "-o".into(),
                 self.pool_url.clone(),
                 "-u".into(),
-                self.stratum_user(),
+                self.pool_username.clone(),
                 "-p".into(),
                 "x".into(),
                 "-t".into(),
@@ -130,7 +263,7 @@ mod tests {
     #[test]
     fn wallet_is_trimmed() {
         let c = cfg(&[("WALLET", "  bc1qexamplewalletaddress0000000000  ")]).unwrap();
-        assert_eq!(c.wallet, "bc1qexamplewalletaddress0000000000");
+        assert_eq!(c.payout_address, "bc1qexamplewalletaddress0000000000");
     }
 
     #[test]
@@ -173,15 +306,97 @@ mod tests {
     }
 
     #[test]
-    fn stratum_user_appends_worker_name() {
+    fn pool_username_appends_worker_name() {
         let c = cfg(&[WALLET, ("WORKER_NAME", "vps1")]).unwrap();
-        assert_eq!(c.stratum_user(), "bc1qexamplewalletaddress0000000000.vps1");
+        assert_eq!(c.pool_username, "bc1qexamplewalletaddress0000000000.vps1");
     }
 
     #[test]
-    fn stratum_user_keeps_wallet_with_embedded_worker() {
+    fn pool_username_keeps_wallet_with_embedded_worker() {
         let c = cfg(&[("WALLET", "bc1qexamplewalletaddress0000000000.rig")]).unwrap();
-        assert_eq!(c.stratum_user(), "bc1qexamplewalletaddress0000000000.rig");
+        assert_eq!(c.pool_username, "bc1qexamplewalletaddress0000000000.rig");
+    }
+
+    #[test]
+    fn pool_username_override_is_used_verbatim() {
+        let c = cfg(&[WALLET, ("POOL_USERNAME", "custom.user")]).unwrap();
+        assert_eq!(c.pool_username, "custom.user");
+    }
+
+    #[test]
+    fn empty_pool_username_override_is_rejected() {
+        assert!(cfg(&[WALLET, ("POOL_USERNAME", "   ")]).is_err());
+    }
+
+    #[test]
+    fn mode_defaults_to_solo() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert_eq!(c.mode, MiningMode::Solo);
+    }
+
+    #[test]
+    fn mode_shared_is_explicitly_rejected() {
+        let err = cfg(&[WALLET, ("MODE", "shared")]).unwrap_err();
+        assert!(err.contains("not implemented"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn mode_rejects_unknown_value() {
+        assert!(cfg(&[WALLET, ("MODE", "pooled")]).is_err());
+    }
+
+    #[test]
+    fn network_defaults_to_mainnet() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert_eq!(c.network, BitcoinNetwork::Mainnet);
+    }
+
+    #[test]
+    fn network_accepts_testnet() {
+        let c = cfg(&[WALLET, ("NETWORK", "testnet")]).unwrap();
+        assert_eq!(c.network, BitcoinNetwork::Testnet);
+    }
+
+    #[test]
+    fn network_rejects_unknown_value() {
+        assert!(cfg(&[WALLET, ("NETWORK", "regtest")]).is_err());
+    }
+
+    #[test]
+    fn tls_policy_defaults_to_plaintext_allowed() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert_eq!(c.tls_policy, TlsPolicy::PlaintextAllowed);
+    }
+
+    #[test]
+    fn tls_policy_required_is_explicitly_rejected() {
+        let err = cfg(&[WALLET, ("TLS_POLICY", "required")]).unwrap_err();
+        assert!(err.contains("not supported"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tls_policy_rejects_unknown_value() {
+        assert!(cfg(&[WALLET, ("TLS_POLICY", "opportunistic")]).is_err());
+    }
+
+    #[test]
+    fn secret_file_missing_path_is_rejected() {
+        assert!(cfg(&[WALLET, ("SECRET_FILE", "/nonexistent/secret")]).is_err());
+    }
+
+    #[test]
+    fn secret_file_existing_path_is_accepted() {
+        let path = std::env::temp_dir().join("miner-config-test-secret-file");
+        std::fs::write(&path, "sekrit\n").unwrap();
+        let c = cfg(&[WALLET, ("SECRET_FILE", path.to_str().unwrap())]).unwrap();
+        assert_eq!(c.secret_file.as_deref(), path.to_str());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn secret_file_defaults_to_none() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert!(c.secret_file.is_none());
     }
 
     #[test]

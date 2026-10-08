@@ -145,7 +145,7 @@ async fn api_stats(State(app): State<SharedApp>, headers: HeaderMap) -> Response
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let (pool, network) = app.cache.get(&app.cfg.wallet).await;
+    let (pool, network) = app.cache.get(&app.cfg.payout_address).await;
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -161,7 +161,7 @@ async fn api_stats(State(app): State<SharedApp>, headers: HeaderMap) -> Response
             "threads": app.cfg.threads(cores),
             "cores": cores,
             "power": app.cfg.power,
-            "worker": app.cfg.stratum_user(),
+            "worker": app.cfg.pool_username,
             "pool_url": app.cfg.pool_url,
         },
         "pool": pool,
