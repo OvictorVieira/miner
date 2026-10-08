@@ -162,6 +162,10 @@ pub struct Config {
     #[allow(dead_code)]
     pub tls_policy: TlsPolicy,
     pub power: u8,
+    /// Whole-core cap mirroring the container's `cpus:` ceiling. `None`
+    /// means "no cap known"; set, it clamps `threads()` so the engine
+    /// never launches more workers than Docker allows CPU time for.
+    pub cpu_limit: Option<u32>,
     pub port: u16,
     // Validated at load time; carried on Config so operators can see which
     // profile the running process picked up.
@@ -253,6 +257,26 @@ impl Config {
                 ))?,
         };
 
+        let cpu_limit = match get("CPU_LIMIT") {
+            None => None,
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    let parsed: f32 = trimmed
+                        .parse()
+                        .map_err(|_| format!("CPU_LIMIT must be a positive number, got {raw:?}"))?;
+                    if parsed <= 0.0 || !parsed.is_finite() {
+                        return Err(format!("CPU_LIMIT must be a positive number, got {raw:?}"));
+                    }
+                    // Floor to whole cores for thread accounting; Docker still
+                    // enforces the fractional cap at runtime.
+                    Some(parsed.floor().max(1.0) as u32)
+                }
+            }
+        };
+
         let port = match get("PORT") {
             None => 3500,
             Some(raw) => raw
@@ -312,6 +336,7 @@ impl Config {
             pool_url: get("POOL_URL").unwrap_or_else(|| DEFAULT_POOL_URL.into()),
             tls_policy,
             power,
+            cpu_limit,
             port,
             profile,
             engine,
@@ -319,9 +344,16 @@ impl Config {
         })
     }
 
-    /// Miner threads for a given core count, honoring POWER%. Never less than 1.
+    /// Miner threads for a given core count, honoring POWER%. Capped by
+    /// `CPU_LIMIT` when set, so the engine never launches more workers than
+    /// the container's `cpus:` ceiling can actually schedule. Never less
+    /// than 1.
     pub fn threads(&self, cores: usize) -> usize {
-        max(1, cores * self.power as usize / 100)
+        let base = max(1, cores * self.power as usize / 100);
+        match self.cpu_limit {
+            Some(limit) => max(1, base.min(limit as usize)),
+            None => base,
+        }
     }
 
     /// Argv the supervisor will pass straight to the engine binary. Never
@@ -617,6 +649,55 @@ mod tests {
         .unwrap();
         let argv = c.miner_command_args(1);
         assert_eq!(argv, vec!["--note=hello;rm$(whoami)"]);
+    }
+
+    #[test]
+    fn cpu_limit_defaults_to_none() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert!(c.cpu_limit.is_none());
+    }
+
+    #[test]
+    fn cpu_limit_is_parsed_and_floored_to_whole_cores() {
+        let c = cfg(&[WALLET, ("CPU_LIMIT", "2")]).unwrap();
+        assert_eq!(c.cpu_limit, Some(2));
+
+        let c = cfg(&[WALLET, ("CPU_LIMIT", "2.5")]).unwrap();
+        assert_eq!(c.cpu_limit, Some(2));
+
+        let c = cfg(&[WALLET, ("CPU_LIMIT", "0.5")]).unwrap();
+        // Fractional cap floors to 0 cores, but we never go below 1.
+        assert_eq!(c.cpu_limit, Some(1));
+    }
+
+    #[test]
+    fn cpu_limit_blank_is_treated_as_unset() {
+        let c = cfg(&[WALLET, ("CPU_LIMIT", "   ")]).unwrap();
+        assert!(c.cpu_limit.is_none());
+    }
+
+    #[test]
+    fn cpu_limit_rejects_nonpositive_and_nonnumeric() {
+        for bad in ["0", "-1", "abc"] {
+            assert!(
+                cfg(&[WALLET, ("CPU_LIMIT", bad)]).is_err(),
+                "CPU_LIMIT={bad:?} should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn threads_are_capped_by_cpu_limit() {
+        // POWER=100 on an 8-core host would normally request 8 threads, but a
+        // CPU_LIMIT of 2 pins the ceiling at 2 — matching the container cap.
+        let c = cfg(&[WALLET, ("POWER", "100"), ("CPU_LIMIT", "2")]).unwrap();
+        assert_eq!(c.threads(8), 2);
+        // Lower demand still honored.
+        let c = cfg(&[WALLET, ("POWER", "25"), ("CPU_LIMIT", "4")]).unwrap();
+        assert_eq!(c.threads(8), 2);
+        // No cap set — behavior unchanged from US-002.
+        let c = cfg(&[WALLET, ("POWER", "100")]).unwrap();
+        assert_eq!(c.threads(8), 8);
     }
 
     #[test]

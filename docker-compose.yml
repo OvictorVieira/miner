@@ -26,6 +26,34 @@ services:
     # bounded tmpfs for libcurl / glibc scratch space.
     tmpfs:
       - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    # Hard CPU cap. Default: 2.0 whole CPUs — a conservative, documented
+    # share of a modern host that leaves cores for the rest of the system.
+    # The miner's POWER (1-100) still applies on top: threads are
+    # `min(cores * POWER / 100, CPU_LIMIT)` so the engine never launches
+    # more worker threads than the host can give it.
+    cpus: "${CPU_LIMIT:-2.0}"
+    # Hard memory ceiling. The engine's working set is tiny; this cap
+    # exists so a leak or runaway allocation gets OOM-killed instead of
+    # swapping the host to death.
+    mem_limit: 512m
+    mem_reservation: 128m
+    # Bound process count — a fork bomb inside the container is contained.
+    pids_limit: 128
+    ulimits:
+      # Disable core dumps in the release service: a crash must not
+      # write process memory (which may contain pool credentials) to disk.
+      core: 0
+      # Cap open file descriptors. The miner only needs a handful.
+      nofile:
+        soft: 1024
+        hard: 1024
+    # Bounded Docker log rotation — stdout/stderr can never fill the host
+    # disk. 10 MiB per file × 5 files = 50 MiB per container at most.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     ports:
       - "3500:3500"
     environment:
@@ -35,8 +63,8 @@ services:
       POWER: ${POWER:-50}
       # Worker name shown at the pool (useful with multiple instances)
       WORKER_NAME: ${WORKER_NAME:-miner}
+      # Mirrors the `cpus:` cap above so the Rust supervisor caps worker
+      # threads to the same whole-core budget Docker enforces.
+      CPU_LIMIT: ${CPU_LIMIT:-2}
       # Dashboard password; without it the panel is public read-only
       # DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
-    # Hard CPU cap for the whole container, on top of POWER — plays nice
-    # with other projects on the same box:
-    # cpus: "2.0"

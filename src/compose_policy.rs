@@ -168,6 +168,168 @@ mod tests {
     }
 
     #[test]
+    fn cpus_cap_is_set() {
+        let lines = active_lines(&compose_contents());
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("cpus:"))
+            .expect("docker-compose.yml must set a `cpus:` ceiling on the miner service");
+        let value = line
+            .trim_start_matches("cpus:")
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'');
+        // Accept either a literal number (e.g. "2.0") or the documented
+        // CPU_LIMIT interpolation (e.g. "${CPU_LIMIT:-2.0}"). Both resolve
+        // to a documented, bounded fraction of host CPUs.
+        assert!(
+            value.parse::<f32>().is_ok() || value.starts_with("${CPU_LIMIT"),
+            "cpus must be a number or a ${{CPU_LIMIT:-...}} default, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn cpu_limit_env_is_wired_into_container() {
+        let contents = compose_contents();
+        let lines = active_lines(&contents);
+        // The container-side env must mirror the compose-level cap so the
+        // Rust supervisor can clamp worker threads to the same budget.
+        assert!(
+            lines.iter().any(|l| l.starts_with("CPU_LIMIT:")),
+            "environment must expose CPU_LIMIT to the container"
+        );
+    }
+
+    #[test]
+    fn memory_limit_is_set() {
+        let lines = active_lines(&compose_contents());
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("mem_limit:"))
+            .expect("docker-compose.yml must set `mem_limit:` on the miner service");
+        let value = line.trim_start_matches("mem_limit:").trim();
+        assert!(
+            !value.is_empty(),
+            "mem_limit must be a bounded value (e.g. 512m)"
+        );
+    }
+
+    #[test]
+    fn pids_limit_is_set() {
+        let lines = active_lines(&compose_contents());
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("pids_limit:"))
+            .expect("docker-compose.yml must set `pids_limit:` on the miner service");
+        let value = line
+            .trim_start_matches("pids_limit:")
+            .trim()
+            .parse::<u32>()
+            .unwrap_or_else(|_| panic!("pids_limit must be a positive integer, got {line:?}"));
+        assert!(value > 0, "pids_limit must be positive, got {value}");
+    }
+
+    #[test]
+    fn core_dumps_are_disabled() {
+        let contents = compose_contents();
+        let lines = active_lines(&contents);
+        let idx = lines
+            .iter()
+            .position(|l| l.starts_with("ulimits:"))
+            .expect("docker-compose.yml must declare `ulimits:` on the miner service");
+        let follow = &lines[idx + 1..];
+        // Accept both the short form (`core: 0`) and a `core:` block with
+        // nested `soft:`/`hard:` entries, as long as both resolve to 0.
+        let core_short = follow
+            .iter()
+            .take_while(|l| !l.ends_with(':') || l.starts_with("- "))
+            .find(|l| l.starts_with("core:") && l.trim_start_matches("core:").trim() == "0");
+        if core_short.is_some() {
+            return;
+        }
+        let core_block = follow
+            .iter()
+            .position(|l| l == "core:")
+            .expect("ulimits must disable core dumps via `core: 0` or a `core:` block");
+        let inner = &follow[core_block + 1..];
+        let soft = inner
+            .iter()
+            .find(|l| l.starts_with("soft:"))
+            .and_then(|l| l.trim_start_matches("soft:").trim().parse::<u32>().ok());
+        let hard = inner
+            .iter()
+            .find(|l| l.starts_with("hard:"))
+            .and_then(|l| l.trim_start_matches("hard:").trim().parse::<u32>().ok());
+        assert_eq!(soft, Some(0), "core soft limit must be 0");
+        assert_eq!(hard, Some(0), "core hard limit must be 0");
+    }
+
+    #[test]
+    fn nofile_limit_is_bounded() {
+        let contents = compose_contents();
+        let lines = active_lines(&contents);
+        let idx = lines
+            .iter()
+            .position(|l| l.starts_with("ulimits:"))
+            .expect("docker-compose.yml must declare `ulimits:` on the miner service");
+        let follow = &lines[idx + 1..];
+        let nofile_block = follow
+            .iter()
+            .position(|l| l == "nofile:")
+            .expect("ulimits must set an nofile ceiling");
+        let inner = &follow[nofile_block + 1..];
+        let soft = inner
+            .iter()
+            .find(|l| l.starts_with("soft:"))
+            .and_then(|l| l.trim_start_matches("soft:").trim().parse::<u32>().ok())
+            .expect("nofile.soft must be a positive integer");
+        let hard = inner
+            .iter()
+            .find(|l| l.starts_with("hard:"))
+            .and_then(|l| l.trim_start_matches("hard:").trim().parse::<u32>().ok())
+            .expect("nofile.hard must be a positive integer");
+        assert!(soft > 0 && soft <= 65_536, "nofile.soft must be bounded");
+        assert!(hard > 0 && hard <= 65_536, "nofile.hard must be bounded");
+    }
+
+    #[test]
+    fn log_rotation_is_bounded() {
+        let contents = compose_contents();
+        let lines = active_lines(&contents);
+        let idx = lines
+            .iter()
+            .position(|l| l.starts_with("logging:"))
+            .expect("docker-compose.yml must declare `logging:` on the miner service");
+        let follow = &lines[idx + 1..];
+        let driver = follow
+            .iter()
+            .find(|l| l.starts_with("driver:"))
+            .expect("logging must declare a driver")
+            .trim_start_matches("driver:")
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'');
+        assert_eq!(driver, "json-file", "log driver must be json-file");
+        let max_size = follow
+            .iter()
+            .find(|l| l.starts_with("max-size:"))
+            .expect("logging.options must set max-size")
+            .trim_start_matches("max-size:")
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string();
+        assert!(!max_size.is_empty(), "max-size must be set");
+        let max_file: u32 = follow
+            .iter()
+            .find(|l| l.starts_with("max-file:"))
+            .expect("logging.options must set max-file")
+            .trim_start_matches("max-file:")
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .parse()
+            .unwrap_or_else(|_| panic!("max-file must be an integer"));
+        assert!(max_file > 0, "max-file must be positive");
+    }
+
+    #[test]
     fn tmpfs_is_bounded_and_safe() {
         let contents = compose_contents();
         let lines = active_lines(&contents);
