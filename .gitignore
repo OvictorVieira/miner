@@ -1,3 +1,9 @@
 /target
 .env
 /.idea
+
+# Ralph files
+/tasks
+.ralph
+prd.json
+progress.txt
