@@ -3,6 +3,7 @@ mod bitcoin_address;
 mod config;
 mod cpuminer_policy;
 mod dockerfile_policy;
+mod fake_stratum;
 mod miner;
 mod stats;
 
