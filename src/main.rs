@@ -6,6 +6,7 @@ mod dockerfile_policy;
 mod fake_stratum;
 mod miner;
 mod payout_identity;
+mod sha256d_self_test;
 mod stats;
 
 use std::sync::Arc;
@@ -34,6 +35,19 @@ type SharedApp = Arc<App>;
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().skip(1).any(|a| a == "--self-test") {
+        match sha256d_self_test::run() {
+            Ok(()) => {
+                println!("sha256d self-test: OK");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("sha256d self-test: FAIL\n{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     tracing_subscriber::fmt().with_target(false).init();
 
     let cfg = match config::Config::from_env() {

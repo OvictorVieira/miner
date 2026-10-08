@@ -22,3 +22,21 @@ jobs:
 
       - name: Tests
         run: cargo test --locked
+
+  self-test:
+    name: SHA-256d engine self-test (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Run SHA-256d self-test
+        run: ./target/release/miner --self-test
