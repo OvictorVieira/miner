@@ -29,8 +29,6 @@ Check your worker at `https://web.public-pool.io/#/app/YOUR_WALLET`.
 | `WORKER_NAME` | `miner` | Worker name shown at the pool (useful with multiple instances) |
 | `PORT` | `3500` | Dashboard port |
 | `DASHBOARD_PASSWORD` | — | Dashboard password; without it the panel is public read-only |
-| `MINER_BIN` | `/usr/local/bin/minerd` | Miner binary |
-| `MINER_ARGS` | — | Custom miner arguments (see below) |
 
 ### Advanced (typed, validated; defaults are correct for almost everyone)
 
@@ -46,39 +44,14 @@ Check your worker at `https://web.public-pool.io/#/app/YOUR_WALLET`.
 To cap resource usage beyond `POWER`, use Docker's own CPU limit
 (`cpus: "2.0"` in compose).
 
-## Pluggable engine (GPU, other miners)
+## Engine
 
-The mining engine is swappable via env: mount your own binary into the
-container and point `MINER_BIN` + `MINER_ARGS` at it. Inside the arguments,
-`{POOL}`, `{USER}` and `{THREADS}` are substituted from the configuration:
-
-```yaml
-services:
-  miner:
-    image: ghcr.io/fullsystem/miner:latest
-    volumes:
-      - ./my-gpu-miner:/opt/gpu-miner:ro
-    environment:
-      WALLET: bc1q...
-      MINER_BIN: /opt/gpu-miner
-      MINER_ARGS: "--url {POOL} --user {USER} --pass x --gpu 0"
-    # NVIDIA GPU: requires nvidia-container-toolkit on the host
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
-```
-
-The supervisor (backoff restarts, clean shutdown, `/health`) works the same
-for any engine.
-
-> **An honest note on GPU + Bitcoin**: GPUs lost the SHA-256d race to ASICs
-> around 2013. A GPU improves your odds ~1000x over a CPU, but the lottery is
-> still a lottery. This feature exists for flexibility (other algorithms,
-> pools, miners) — not for economic viability on BTC.
+The release image runs the reviewed, image-baked
+[pooler/cpuminer](https://github.com/pooler/cpuminer) exclusively. Setting
+`MINER_BIN` or `MINER_ARGS` is rejected: host-mounted engines are a
+development-only feature and have no supported release path. Contributors who
+need to iterate against another engine opt in explicitly with
+`MINER_PROFILE=development` — this is not for production.
 
 ## Architecture
 

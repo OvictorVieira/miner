@@ -6,6 +6,82 @@ use std::path::Path;
 /// an advanced, undocumented-for-beginners knob until then.
 const DEFAULT_POOL_URL: &str = "stratum+tcp://public-pool.io:21496";
 
+/// Path to the SHA-256d engine baked into the image at build time.
+pub(crate) const BUNDLED_CPUMINER_BIN: &str = "/usr/local/bin/minerd";
+
+/// Deployment profile. The release profile is the reviewed, image-only path
+/// consumers get by default; the development profile exists so contributors
+/// can swap in an arbitrary engine without that becoming an attack surface in
+/// production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinerProfile {
+    Release,
+    Development,
+}
+
+impl MinerProfile {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "release" => Ok(MinerProfile::Release),
+            "development" | "dev" => Ok(MinerProfile::Development),
+            other => Err(format!(
+                "MINER_PROFILE must be 'release' or 'development', got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Mining engine adapter. The release profile is confined to
+/// `BundledCpuminer`; `Custom` is reachable only through the development
+/// profile and never from a shipped image's defaults.
+#[derive(Debug, Clone)]
+pub enum Engine {
+    /// Reviewed SHA-256d engine compiled into the image. Argv is fixed.
+    BundledCpuminer,
+    /// Arbitrary engine. `args_template` is already tokenized argv; tokens
+    /// may contain `{POOL}`, `{USER}`, `{THREADS}` placeholders. Reserved for
+    /// the development profile.
+    Custom {
+        binary: String,
+        args_template: Vec<String>,
+    },
+}
+
+impl Engine {
+    pub fn binary(&self) -> &str {
+        match self {
+            Engine::BundledCpuminer => BUNDLED_CPUMINER_BIN,
+            Engine::Custom { binary, .. } => binary,
+        }
+    }
+
+    pub fn argv(&self, threads: usize, pool_url: &str, pool_username: &str) -> Vec<String> {
+        match self {
+            Engine::BundledCpuminer => vec![
+                "-a".into(),
+                "sha256d".into(),
+                "-o".into(),
+                pool_url.into(),
+                "-u".into(),
+                pool_username.into(),
+                "-p".into(),
+                "x".into(),
+                "-t".into(),
+                threads.to_string(),
+            ],
+            Engine::Custom { args_template, .. } => args_template
+                .iter()
+                .map(|token| {
+                    token
+                        .replace("{POOL}", pool_url)
+                        .replace("{USER}", pool_username)
+                        .replace("{THREADS}", &threads.to_string())
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Mining topology. Only `Solo` is implemented in this MVP; `Shared` is
 /// modeled now so a future pool-account flow has a typed home, but selecting
 /// it today is an explicit, documented error rather than a silent fallback.
@@ -87,8 +163,11 @@ pub struct Config {
     pub tls_policy: TlsPolicy,
     pub power: u8,
     pub port: u16,
-    pub miner_bin: String,
-    pub miner_args: Option<String>,
+    // Validated at load time; carried on Config so operators can see which
+    // profile the running process picked up.
+    #[allow(dead_code)]
+    pub profile: MinerProfile,
+    pub engine: Engine,
     // Read in phase 2 (dashboard login screen)
     #[allow(dead_code)]
     pub dashboard_password: Option<String>,
@@ -182,6 +261,47 @@ impl Config {
                 .map_err(|_| format!("PORT must be a number, got {raw:?}"))?,
         };
 
+        let profile = match get("MINER_PROFILE") {
+            None => MinerProfile::Release,
+            Some(raw) => MinerProfile::parse(&raw)?,
+        };
+        let miner_bin_override = get("MINER_BIN").filter(|v| !v.trim().is_empty());
+        let miner_args_override = get("MINER_ARGS").filter(|v| !v.trim().is_empty());
+
+        let engine = match profile {
+            MinerProfile::Release => {
+                if miner_bin_override.is_some() {
+                    return Err(
+                        "MINER_BIN is rejected in the release profile: only the reviewed, \
+                         image-baked cpuminer is allowed. Host-mounted engines are a \
+                         development-only feature — set MINER_PROFILE=development to opt in."
+                            .into(),
+                    );
+                }
+                if miner_args_override.is_some() {
+                    return Err(
+                        "MINER_ARGS is rejected in the release profile: the bundled engine's \
+                         argv is fixed. Set MINER_PROFILE=development to supply custom argv."
+                            .into(),
+                    );
+                }
+                Engine::BundledCpuminer
+            }
+            MinerProfile::Development => match (miner_bin_override, miner_args_override) {
+                (None, None) => Engine::BundledCpuminer,
+                (bin, args) => {
+                    let binary = bin.unwrap_or_else(|| BUNDLED_CPUMINER_BIN.to_string());
+                    let args_template: Vec<String> = args
+                        .map(|raw| raw.split_whitespace().map(String::from).collect())
+                        .unwrap_or_default();
+                    Engine::Custom {
+                        binary,
+                        args_template,
+                    }
+                }
+            },
+        };
+
         Ok(Config {
             mode,
             network,
@@ -193,8 +313,8 @@ impl Config {
             tls_policy,
             power,
             port,
-            miner_bin: get("MINER_BIN").unwrap_or_else(|| "/usr/local/bin/minerd".into()),
-            miner_args: get("MINER_ARGS").filter(|a| !a.trim().is_empty()),
+            profile,
+            engine,
             dashboard_password: get("DASHBOARD_PASSWORD").filter(|p| !p.is_empty()),
         })
     }
@@ -204,34 +324,12 @@ impl Config {
         max(1, cores * self.power as usize / 100)
     }
 
-    /// Arguments for the miner process. With MINER_ARGS set, the engine is
-    /// fully pluggable (GPU miners, other algos): each token has {POOL},
-    /// {USER} and {THREADS} substituted. Otherwise, defaults to cpuminer
-    /// sha256d flags.
+    /// Argv the supervisor will pass straight to the engine binary. Never
+    /// routed through a shell: the supervisor calls `Command::new(binary)`
+    /// with these tokens via `.args(...)` so no shell expansion is possible.
     pub fn miner_command_args(&self, threads: usize) -> Vec<String> {
-        match &self.miner_args {
-            Some(raw) => raw
-                .split_whitespace()
-                .map(|token| {
-                    token
-                        .replace("{POOL}", &self.pool_url)
-                        .replace("{USER}", &self.pool_username)
-                        .replace("{THREADS}", &threads.to_string())
-                })
-                .collect(),
-            None => vec![
-                "-a".into(),
-                "sha256d".into(),
-                "-o".into(),
-                self.pool_url.clone(),
-                "-u".into(),
-                self.pool_username.clone(),
-                "-p".into(),
-                "x".into(),
-                "-t".into(),
-                threads.to_string(),
-            ],
-        }
+        self.engine
+            .argv(threads, &self.pool_url, &self.pool_username)
     }
 }
 
@@ -427,15 +525,53 @@ mod tests {
     }
 
     #[test]
-    fn custom_miner_args_substitute_placeholders() {
+    fn default_profile_is_release() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert_eq!(c.profile, MinerProfile::Release);
+        assert!(matches!(c.engine, Engine::BundledCpuminer));
+        assert_eq!(c.engine.binary(), BUNDLED_CPUMINER_BIN);
+    }
+
+    #[test]
+    fn release_profile_rejects_miner_bin() {
+        let err = cfg(&[WALLET, ("MINER_BIN", "/host/mounted/evil")]).unwrap_err();
+        assert!(err.contains("MINER_BIN"), "unexpected error: {err}");
+        assert!(err.contains("development"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn release_profile_rejects_miner_args() {
+        let err = cfg(&[WALLET, ("MINER_ARGS", "--benchmark")]).unwrap_err();
+        assert!(err.contains("MINER_ARGS"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn blank_miner_bin_or_args_do_not_trip_release_guard() {
+        // Operators may leave the vars declared but empty; that's equivalent
+        // to unset and must not reject the release profile.
+        let c = cfg(&[WALLET, ("MINER_BIN", "   "), ("MINER_ARGS", "   ")]).unwrap();
+        assert!(matches!(c.engine, Engine::BundledCpuminer));
+    }
+
+    #[test]
+    fn miner_profile_rejects_unknown_value() {
+        assert!(cfg(&[WALLET, ("MINER_PROFILE", "staging")]).is_err());
+    }
+
+    #[test]
+    fn development_profile_accepts_custom_engine() {
         let c = cfg(&[
             WALLET,
+            ("MINER_PROFILE", "development"),
+            ("MINER_BIN", "/opt/gpu-miner"),
             (
                 "MINER_ARGS",
                 "--url {POOL} --user {USER} --threads {THREADS} --gpu 0",
             ),
         ])
         .unwrap();
+        assert_eq!(c.profile, MinerProfile::Development);
+        assert_eq!(c.engine.binary(), "/opt/gpu-miner");
         assert_eq!(
             c.miner_command_args(4),
             vec![
@@ -452,15 +588,35 @@ mod tests {
     }
 
     #[test]
-    fn custom_miner_args_without_placeholders_pass_verbatim() {
-        let c = cfg(&[WALLET, ("MINER_ARGS", "--benchmark")]).unwrap();
+    fn development_profile_without_overrides_still_uses_bundled() {
+        let c = cfg(&[WALLET, ("MINER_PROFILE", "dev")]).unwrap();
+        assert!(matches!(c.engine, Engine::BundledCpuminer));
+    }
+
+    #[test]
+    fn development_profile_custom_args_pass_verbatim() {
+        let c = cfg(&[
+            WALLET,
+            ("MINER_PROFILE", "development"),
+            ("MINER_ARGS", "--benchmark"),
+        ])
+        .unwrap();
         assert_eq!(c.miner_command_args(8), vec!["--benchmark"]);
     }
 
     #[test]
-    fn blank_miner_args_fall_back_to_default() {
-        let c = cfg(&[WALLET, ("MINER_ARGS", "   ")]).unwrap();
-        assert_eq!(c.miner_command_args(1)[..2], ["-a", "sha256d"]);
+    fn argv_is_a_tokenized_vec_not_a_shell_string() {
+        // The acceptance criterion is that engine arguments are built as an
+        // argv array; this test pins that an attempted shell metacharacter
+        // ends up as a single argv token, not multiple shell-expanded ones.
+        let c = cfg(&[
+            WALLET,
+            ("MINER_PROFILE", "development"),
+            ("MINER_ARGS", "--note=hello;rm$(whoami)"),
+        ])
+        .unwrap();
+        let argv = c.miner_command_args(1);
+        assert_eq!(argv, vec!["--note=hello;rm$(whoami)"]);
     }
 
     #[test]
