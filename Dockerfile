@@ -47,13 +47,15 @@ LABEL org.opencontainers.image.source="https://github.com/pooler/cpuminer" \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --no-create-home --shell /usr/sbin/nologin miner
+    && groupadd --system --gid 10001 miner \
+    && useradd --system --no-create-home --shell /usr/sbin/nologin \
+         --uid 10001 --gid 10001 miner
 
 COPY --from=cpuminer-build /src/minerd /usr/local/bin/minerd
 COPY --from=cpuminer-build /src/CPUMINER_COMMIT /usr/local/share/cpuminer-commit
 COPY --from=app-build /app/target/release/miner /usr/local/bin/miner
 
-USER miner
+USER 10001:10001
 ENV PORT=3500
 EXPOSE 3500
 

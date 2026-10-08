@@ -3,6 +3,29 @@ services:
     image: ghcr.io/fullsystem/miner:latest
     build: .
     restart: unless-stopped
+    # Non-root numeric UID/GID matches the `miner` user baked into the image.
+    user: "10001:10001"
+    # Immutable root filesystem — only the explicit tmpfs below is writable.
+    read_only: true
+    # Drop every Linux capability. The miner needs none.
+    cap_drop:
+      - ALL
+    # Keep Docker's default seccomp profile active (never seccomp=unconfined)
+    # and forbid gaining new privileges via setuid/setgid binaries.
+    security_opt:
+      - no-new-privileges:true
+    # Do NOT enable privileged mode and do NOT share host namespaces.
+    # These lines are intentionally commented so a reviewer sees them.
+    # privileged: false            # (default — never set to true)
+    # pid: host                    # (never)
+    # ipc: host                    # (never)
+    # network: host                # (never)
+    # userns_mode: host            # (never)
+    # No named volume and no host bind mount in the MVP — the container must
+    # not reach outside its own filesystem. The one writable area is a
+    # bounded tmpfs for libcurl / glibc scratch space.
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
     ports:
       - "3500:3500"
     environment:
