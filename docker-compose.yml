@@ -54,9 +54,18 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+    # Dashboard is published on the host's loopback interface only.
+    # Remote/LAN access is explicitly out of scope in this MVP (see
+    # SECURITY.md, US-036). The container-side bind to 0.0.0.0 is safe
+    # ONLY because this publication address is 127.0.0.1 — never change
+    # the host side to 0.0.0.0, a LAN IP, or :: without also shipping the
+    # authenticated-session work (US-037..039).
     ports:
-      - "3500:3500"
+      - "127.0.0.1:3500:3500"
     environment:
+      # Tells the Rust supervisor it is running inside a container, so the
+      # dashboard may bind to 0.0.0.0 (otherwise it refuses non-loopback).
+      IN_CONTAINER: "1"
       # Your BTC wallet — the only required variable
       WALLET: ${WALLET:?Set WALLET in .env}
       # Percentage of CPU cores used by the miner (1-100)

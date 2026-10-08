@@ -330,6 +330,68 @@ mod tests {
     }
 
     #[test]
+    fn published_port_is_loopback_only() {
+        let contents = compose_contents();
+        let lines = active_lines(&contents);
+        let idx = lines
+            .iter()
+            .position(|l| l.starts_with("ports:"))
+            .expect("docker-compose.yml must declare `ports:` on the miner service");
+        // Collect every list item under `ports:` until the next top-level key.
+        let entries: Vec<String> = lines[idx + 1..]
+            .iter()
+            .take_while(|l| l.starts_with("- "))
+            .map(|l| {
+                l.trim_start_matches("- ")
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            !entries.is_empty(),
+            "ports list must have at least one entry"
+        );
+        for entry in &entries {
+            assert!(
+                entry.starts_with("127.0.0.1:"),
+                "published port must be bound to 127.0.0.1 (loopback) only, got {entry:?}. \
+                 Remote/LAN access is explicitly out of scope in the MVP (US-036)."
+            );
+            // Rule out `127.0.0.1:3500:0.0.0.0:3500`-style tricks where the
+            // operator smuggles a non-loopback host IP into the second colon
+            // field. The spec is HOST_IP:HOST_PORT:CONTAINER_PORT — exactly
+            // three colon-separated fields.
+            let parts: Vec<&str> = entry.split(':').collect();
+            assert_eq!(
+                parts.len(),
+                3,
+                "port entry must be HOST_IP:HOST_PORT:CONTAINER_PORT, got {entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_container_env_is_wired() {
+        let contents = compose_contents();
+        let lines = active_lines(&contents);
+        // IN_CONTAINER signals the Rust supervisor it may bind 0.0.0.0; without
+        // it the binary refuses non-loopback binds (US-036).
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("IN_CONTAINER:"))
+            .expect("environment must expose IN_CONTAINER to the container");
+        let value = line
+            .trim_start_matches("IN_CONTAINER:")
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'');
+        assert!(
+            matches!(value, "1" | "true" | "yes"),
+            "IN_CONTAINER must be truthy, got {value:?}"
+        );
+    }
+
+    #[test]
     fn tmpfs_is_bounded_and_safe() {
         let contents = compose_contents();
         let lines = active_lines(&contents);

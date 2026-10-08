@@ -11,7 +11,8 @@ projects.
 docker run -d \
   -e WALLET=bc1qyourwallet... \
   -e POWER=50 \
-  -p 3500:3500 \
+  -e IN_CONTAINER=1 \
+  -p 127.0.0.1:3500:3500 \
   ghcr.io/fullsystem/miner:latest
 ```
 
@@ -19,6 +20,16 @@ Or with compose: copy `.env.example` to `.env`, set `WALLET`, and run
 `docker compose up -d`.
 
 Check your worker at `https://web.public-pool.io/#/app/YOUR_WALLET`.
+
+### Dashboard reachability (loopback only)
+
+The dashboard is published on `127.0.0.1:3500` and nothing else. It is reachable
+only from the host that runs the container — not from the LAN, not from another
+host, not from a public IP. Running the binary directly (outside Docker) defaults
+to the same `127.0.0.1` bind and refuses a non-loopback `BIND_ADDRESS` with an
+explicit error. Remote/LAN access is **explicitly out of scope** in this MVP
+until authenticated sessions ship (see `SECURITY.md`). Do not change the host
+side of the port mapping to `0.0.0.0`, a LAN IP, or `::` to work around this.
 
 ## Configuration (env)
 

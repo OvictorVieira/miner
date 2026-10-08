@@ -82,9 +82,14 @@ async fn main() {
         .route("/api/stats", get(api_stats))
         .with_state(app.clone());
 
-    let addr = format!("0.0.0.0:{}", app.cfg.port);
-    tracing::info!("dashboard listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(&addr)
+    let addr = std::net::SocketAddr::new(app.cfg.bind_address, app.cfg.port);
+    let policy = if app.cfg.bind_address.is_loopback() {
+        "loopback-only"
+    } else {
+        "wildcard (container; host publishes 127.0.0.1 only)"
+    };
+    tracing::info!("dashboard listening on http://{addr} (bind policy: {policy})");
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind port");
 

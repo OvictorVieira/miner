@@ -1,4 +1,5 @@
 use std::cmp::max;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 
 /// Fixed MVP pool endpoint. `POOL_URL` can still override it; full syntax
@@ -167,6 +168,14 @@ pub struct Config {
     /// never launches more workers than Docker allows CPU time for.
     pub cpu_limit: Option<u32>,
     pub port: u16,
+    /// Address the dashboard HTTP server binds to. Default is `127.0.0.1`
+    /// outside a container (loopback-only — remote/LAN access is explicitly
+    /// out of scope in the MVP, see SECURITY.md). Inside a container (signaled
+    /// by `IN_CONTAINER=1` from Compose or `/.dockerenv`), the default is
+    /// `0.0.0.0` because the container is only reachable through Compose's
+    /// `127.0.0.1:3500:3500` publication. `BIND_ADDRESS` can override this,
+    /// but non-loopback overrides are refused outside a container.
+    pub bind_address: IpAddr,
     // Validated at load time; carried on Config so operators can see which
     // profile the running process picked up.
     #[allow(dead_code)]
@@ -179,7 +188,21 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
-        Self::from_vars(|k| std::env::var(k).ok())
+        // `/.dockerenv` is Docker's own in-container marker; use it as a
+        // fallback so a running container that forgot to set IN_CONTAINER
+        // still gets the container-side bind defaults.
+        let dockerenv_exists = Path::new("/.dockerenv").exists();
+        Self::from_vars(|k| {
+            if k == "IN_CONTAINER" {
+                match std::env::var(k).ok() {
+                    Some(v) => Some(v),
+                    None if dockerenv_exists => Some("1".into()),
+                    None => None,
+                }
+            } else {
+                std::env::var(k).ok()
+            }
+        })
     }
 
     pub(crate) fn from_vars<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
@@ -285,6 +308,34 @@ impl Config {
                 .map_err(|_| format!("PORT must be a number, got {raw:?}"))?,
         };
 
+        let in_container = matches!(
+            get("IN_CONTAINER").as_deref().map(str::trim),
+            Some("1" | "true" | "True" | "TRUE" | "yes")
+        );
+        let bind_address = match get("BIND_ADDRESS") {
+            None => {
+                if in_container {
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                } else {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                }
+            }
+            Some(raw) => {
+                let trimmed = raw.trim();
+                let ip: IpAddr = trimmed
+                    .parse()
+                    .map_err(|_| format!("BIND_ADDRESS must be a valid IP literal, got {raw:?}"))?;
+                if !in_container && !ip.is_loopback() {
+                    return Err(format!(
+                        "BIND_ADDRESS={trimmed} is refused outside a container: the dashboard \
+                         must bind to a loopback address (127.0.0.1 or ::1). Remote/LAN access \
+                         is explicitly out of scope in this MVP (SECURITY.md, US-036)."
+                    ));
+                }
+                ip
+            }
+        };
+
         let profile = match get("MINER_PROFILE") {
             None => MinerProfile::Release,
             Some(raw) => MinerProfile::parse(&raw)?,
@@ -338,6 +389,7 @@ impl Config {
             power,
             cpu_limit,
             port,
+            bind_address,
             profile,
             engine,
             dashboard_password: get("DASHBOARD_PASSWORD").filter(|p| !p.is_empty()),
@@ -706,5 +758,74 @@ mod tests {
         assert_eq!(c.pool_url, "stratum+tcp://public-pool.io:21496");
         assert_eq!(c.port, 3500);
         assert!(c.dashboard_password.is_none());
+    }
+
+    #[test]
+    fn bind_defaults_to_loopback_outside_container() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert_eq!(
+            c.bind_address,
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            "outside a container the dashboard must default to 127.0.0.1"
+        );
+        assert!(c.bind_address.is_loopback());
+    }
+
+    #[test]
+    fn bind_defaults_to_wildcard_inside_container() {
+        let c = cfg(&[WALLET, ("IN_CONTAINER", "1")]).unwrap();
+        assert_eq!(
+            c.bind_address,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            "inside a container the dashboard binds 0.0.0.0 so Compose's \
+             127.0.0.1:3500 publication can forward traffic"
+        );
+    }
+
+    #[test]
+    fn bind_accepts_loopback_override_outside_container() {
+        let c = cfg(&[WALLET, ("BIND_ADDRESS", "127.0.0.1")]).unwrap();
+        assert!(c.bind_address.is_loopback());
+        let c = cfg(&[WALLET, ("BIND_ADDRESS", "::1")]).unwrap();
+        assert!(c.bind_address.is_loopback());
+    }
+
+    #[test]
+    fn bind_refuses_ipv4_wildcard_outside_container() {
+        let err = cfg(&[WALLET, ("BIND_ADDRESS", "0.0.0.0")]).unwrap_err();
+        assert!(err.contains("refused outside a container"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_refuses_ipv6_wildcard_outside_container() {
+        let err = cfg(&[WALLET, ("BIND_ADDRESS", "::")]).unwrap_err();
+        assert!(err.contains("refused outside a container"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_refuses_non_loopback_ipv4_outside_container() {
+        let err = cfg(&[WALLET, ("BIND_ADDRESS", "192.168.1.10")]).unwrap_err();
+        assert!(err.contains("refused outside a container"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_refuses_non_loopback_ipv6_outside_container() {
+        let err = cfg(&[WALLET, ("BIND_ADDRESS", "fe80::1")]).unwrap_err();
+        assert!(err.contains("refused outside a container"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_rejects_non_ip_values() {
+        assert!(cfg(&[WALLET, ("BIND_ADDRESS", "localhost")]).is_err());
+        assert!(cfg(&[WALLET, ("BIND_ADDRESS", "not-an-ip")]).is_err());
+        assert!(cfg(&[WALLET, ("BIND_ADDRESS", "127.0.0.1:3500")]).is_err());
+    }
+
+    #[test]
+    fn bind_allows_wildcard_inside_container_override() {
+        // Operators running the container directly can still override, as
+        // long as IN_CONTAINER is signalled.
+        let c = cfg(&[WALLET, ("IN_CONTAINER", "1"), ("BIND_ADDRESS", "0.0.0.0")]).unwrap();
+        assert_eq!(c.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
 }
