@@ -87,10 +87,26 @@ pub struct SubmitRecord {
 }
 
 /// Record of `mining.authorize` arguments: `[username, password]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is implemented by hand (not derived) so a failed test assertion
+/// that prints an `AuthorizeRecord` does not leak the password into the
+/// test log. Equality still compares passwords as plain strings.
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthorizeRecord {
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for AuthorizeRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizeRecord")
+            .field("username", &self.username)
+            .field(
+                "password",
+                &format_args!("<redacted:{} bytes>", self.password.len()),
+            )
+            .finish()
+    }
 }
 
 /// Everything the fake pool observed during a single connection.

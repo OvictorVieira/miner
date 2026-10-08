@@ -178,7 +178,7 @@ impl Config {
         Self::from_vars(|k| std::env::var(k).ok())
     }
 
-    fn from_vars<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
+    pub(crate) fn from_vars<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
         let mode = match get("MODE") {
             None => MiningMode::Solo,
             Some(raw) => MiningMode::parse(&raw)?,

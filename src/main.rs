@@ -5,6 +5,7 @@ mod cpuminer_policy;
 mod dockerfile_policy;
 mod fake_stratum;
 mod miner;
+mod payout_identity;
 mod stats;
 
 use std::sync::Arc;
