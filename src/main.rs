@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod cpuminer_policy;
 mod dockerfile_policy;
 mod miner;
 mod stats;
