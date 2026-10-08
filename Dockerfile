@@ -1,7 +1,9 @@
 # ── Stage 1: build cpuminer (pooler) from source ────────────────
 # Building from source (instead of committing a binary) keeps the image
 # auditable and enables multi-arch: buildx compiles natively on amd64/arm64.
-FROM debian:bookworm-slim AS cpuminer-build
+#
+# Digest reviewed 2026-10-08. Re-pin when upgrading the tag.
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS cpuminer-build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git build-essential autoconf automake libtool pkg-config libcurl4-openssl-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -10,7 +12,8 @@ WORKDIR /src
 RUN ./autogen.sh && ./configure CFLAGS="-O3" && make -j"$(nproc)"
 
 # ── Stage 2: build the Rust app ─────────────────────────────────
-FROM rust:1.96-slim-bookworm AS app-build
+# rust:1.99-slim-bookworm — digest reviewed 2026-10-08. Re-pin when upgrading.
+FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS app-build
 WORKDIR /app
 # Dependency cache layer: build an empty main first
 COPY Cargo.toml Cargo.lock ./
@@ -22,7 +25,8 @@ COPY assets ./assets
 RUN touch src/main.rs && cargo build --release
 
 # ── Stage 3: final image ────────────────────────────────────────
-FROM debian:bookworm-slim
+# debian:bookworm-slim — digest reviewed 2026-10-08. Re-pin when upgrading.
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
