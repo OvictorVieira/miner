@@ -2,10 +2,10 @@ use std::cmp::max;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 
-/// Fixed MVP pool endpoint. `POOL_URL` can still override it; full syntax
-/// validation of that override is added by US-071 and the override remains
-/// an advanced, undocumented-for-beginners knob until then.
+/// Fixed MVP pool endpoint. `POOL_URL` can still override it, but only with
+/// the same deliberately narrow plaintext Stratum URL shape.
 const DEFAULT_POOL_URL: &str = "stratum+tcp://public-pool.io:21496";
+const MAX_WORKER_NAME_LEN: usize = 64;
 
 /// Path to the SHA-256d engine baked into the image at build time.
 pub(crate) const BUNDLED_CPUMINER_BIN: &str = "/usr/local/bin/minerd";
@@ -142,6 +142,73 @@ impl TlsPolicy {
     }
 }
 
+fn validate_worker_name(raw: &str) -> Result<String, String> {
+    if raw.is_empty() || raw.len() > MAX_WORKER_NAME_LEN {
+        return Err(format!(
+            "WORKER_NAME must be 1 to {MAX_WORKER_NAME_LEN} ASCII characters"
+        ));
+    }
+    if !raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err("WORKER_NAME may contain only ASCII letters, digits, '_' and '-'".into());
+    }
+    Ok(raw.to_string())
+}
+
+fn validate_pool_url(raw: &str) -> Result<String, String> {
+    if raw.is_empty() || !raw.is_ascii() || raw.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err("POOL_URL must be an ASCII URL without whitespace".into());
+    }
+
+    let url = reqwest::Url::parse(raw).map_err(|e| format!("POOL_URL is invalid: {e}"))?;
+    if url.scheme() != "stratum+tcp" {
+        return Err("POOL_URL must use the stratum+tcp scheme".into());
+    }
+    if raw.contains('@') || !url.username().is_empty() || url.password().is_some() {
+        return Err("POOL_URL must not contain credentials".into());
+    }
+    if !url.path().is_empty() || url.query().is_some() || url.fragment().is_some() {
+        return Err("POOL_URL must not contain a path, query, or fragment".into());
+    }
+
+    let host = url
+        .host_str()
+        .ok_or("POOL_URL must contain a DNS hostname")?;
+    if host.parse::<IpAddr>().is_ok() || host.contains(':') {
+        return Err("POOL_URL must use a DNS hostname, not an IP literal".into());
+    }
+    if host.len() > 253
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                || !label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+    {
+        return Err("POOL_URL contains an invalid DNS hostname".into());
+    }
+
+    let port = url
+        .port()
+        .ok_or("POOL_URL must include an explicit numeric port")?;
+    if port == 0 {
+        return Err("POOL_URL port must be between 1 and 65535".into());
+    }
+
+    Ok(raw.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     // Validated at load time; consumed once MODE=shared ships (currently rejected above).
@@ -242,7 +309,11 @@ impl Config {
         crate::bitcoin_address::validate(&payout_address, network)
             .map_err(|e| format!("WALLET is not a valid payout address: {e}"))?;
 
-        let worker_name = get("WORKER_NAME").unwrap_or_else(|| "miner".into());
+        let worker_name =
+            validate_worker_name(&get("WORKER_NAME").unwrap_or_else(|| "miner".into()))?;
+
+        let pool_url =
+            validate_pool_url(&get("POOL_URL").unwrap_or_else(|| DEFAULT_POOL_URL.into()))?;
 
         let pool_username = match get("POOL_USERNAME") {
             Some(raw) => {
@@ -384,7 +455,7 @@ impl Config {
             pool_username,
             worker_name,
             secret_file,
-            pool_url: get("POOL_URL").unwrap_or_else(|| DEFAULT_POOL_URL.into()),
+            pool_url,
             tls_policy,
             power,
             cpu_limit,
@@ -504,6 +575,73 @@ mod tests {
             c.pool_username,
             "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.vps1"
         );
+    }
+
+    #[test]
+    fn worker_name_accepts_only_bounded_safe_characters() {
+        for valid in [
+            "a",
+            "worker-01",
+            "RIG_two",
+            &"a".repeat(MAX_WORKER_NAME_LEN),
+        ] {
+            let c = cfg(&[WALLET, ("WORKER_NAME", valid)]).unwrap();
+            assert_eq!(c.worker_name, valid);
+        }
+
+        for invalid in [
+            "",
+            "two words",
+            "../other-worker",
+            "worker.name",
+            "worker?admin=true",
+            "worker#fragment",
+            "worker\n--threads=99",
+            "--extra CLI flags",
+            &"a".repeat(MAX_WORKER_NAME_LEN + 1),
+        ] {
+            assert!(
+                cfg(&[WALLET, ("WORKER_NAME", invalid)]).is_err(),
+                "WORKER_NAME={invalid:?} should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_url_accepts_only_stratum_dns_host_and_explicit_port() {
+        for valid in [
+            "stratum+tcp://public-pool.io:21496",
+            "stratum+tcp://pool-1.example.com:3333",
+            "stratum+tcp://POOL.EXAMPLE:1",
+        ] {
+            let c = cfg(&[WALLET, ("POOL_URL", valid)]).unwrap();
+            assert_eq!(c.pool_url, valid);
+        }
+
+        for invalid in [
+            "public-pool.io:21496",
+            "http://public-pool.io:21496",
+            "stratum+tcp://public-pool.io",
+            "stratum+tcp://public-pool.io:not-a-port",
+            "stratum+tcp://public-pool.io:0",
+            "stratum+tcp://user:pass@public-pool.io:21496",
+            "stratum+tcp://@public-pool.io:21496",
+            "stratum+tcp://127.0.0.1:21496",
+            "stratum+tcp://[::1]:21496",
+            "stratum+tcp://public-pool.io:21496/",
+            "stratum+tcp://public-pool.io:21496/other",
+            "stratum+tcp://public-pool.io:21496/?admin=true",
+            "stratum+tcp://public-pool.io:21496/#fragment",
+            "stratum+tcp://public-pool.io:21496\n--threads=99",
+            "--extra CLI flags",
+            "stratum+tcp://-bad.example:3333",
+            "stratum+tcp://bad-.example:3333",
+        ] {
+            assert!(
+                cfg(&[WALLET, ("POOL_URL", invalid)]).is_err(),
+                "POOL_URL={invalid:?} should fail"
+            );
+        }
     }
 
     #[test]

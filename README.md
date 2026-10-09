@@ -36,7 +36,7 @@ side of the port mapping to `0.0.0.0`, a LAN IP, or `::` to work around this.
 |---|---|---|
 | `WALLET` | — | **Required.** Your BTC payout address (receives the reward if you ever find a block) |
 | `POWER` | `50` | % of CPU cores used by the miner (1-100) |
-| `WORKER_NAME` | `miner` | Worker name shown at the pool (useful with multiple instances) |
+| `WORKER_NAME` | `miner` | Worker name shown at the pool: 1-64 ASCII letters, digits, `_`, or `-` |
 | `PORT` | `3500` | Dashboard port |
 | `DASHBOARD_PASSWORD` | — | Dashboard password; without it the panel is public read-only |
 
@@ -46,7 +46,7 @@ side of the port mapping to `0.0.0.0`, a LAN IP, or `::` to work around this.
 |---|---|---|
 | `MODE` | `solo` | Mining topology. Only `solo` is implemented; `shared` is rejected with an explicit error |
 | `NETWORK` | `mainnet` | Bitcoin network the payout address belongs to (`mainnet` or `testnet`) |
-| `POOL_URL` | `stratum+tcp://public-pool.io:21496` | Solo pool endpoint (stratum). Overriding this is an advanced, mostly-unvalidated knob |
+| `POOL_URL` | `stratum+tcp://public-pool.io:21496` | Solo pool endpoint. Overrides must be `stratum+tcp://DNS_HOSTNAME:PORT` with no credentials, IP literal, path, query, fragment, or whitespace |
 | `POOL_USERNAME` | `<WALLET>.<WORKER_NAME>` | Override the Stratum username sent to the pool instead of the computed default |
 | `SECRET_FILE` | — | Path to a file holding a pool secret; reserved for shared-pool authentication, unused by `MODE=solo` |
 | `TLS_POLICY` | `plaintext` | Stratum transport policy. `required` is rejected: the bundled cpuminer engine has no TLS support |
