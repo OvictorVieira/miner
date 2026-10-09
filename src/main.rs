@@ -5,6 +5,7 @@ mod config;
 mod cpuminer_policy;
 mod dockerfile_policy;
 mod fake_stratum;
+mod fork_identity_policy;
 mod miner;
 mod payout_identity;
 mod sha256d_self_test;

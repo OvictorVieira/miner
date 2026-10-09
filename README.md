@@ -7,17 +7,16 @@ projects.
 
 ## Usage
 
-```bash
-docker run -d \
-  -e WALLET=bc1qyourwallet... \
-  -e POWER=50 \
-  -e IN_CONTAINER=1 \
-  -p 127.0.0.1:3500:3500 \
-  ghcr.io/fullsystem/miner:latest
-```
+Clone [this repository](https://github.com/OvictorVieira/miner), then build the
+image from the checked-out source. The deliberately local image name and
+`pull_policy: never` ensure Compose never substitutes a registry image.
 
-Or with compose: copy `.env.example` to `.env`, set `WALLET`, and run
-`docker compose up -d`.
+```bash
+cp .env.example .env
+# Set WALLET in .env, then:
+docker compose build
+docker compose up -d --no-build
+```
 
 Check your worker at `https://web.public-pool.io/#/app/YOUR_WALLET`.
 
@@ -85,15 +84,6 @@ for fun, learning, and to support decentralization — not for income.
 ```bash
 cargo test
 WALLET=bc1q... MINER_BIN=/path/to/minerd cargo run
-```
-
-## Support
-
-If this project made you smile (or you actually hit a block — imagine),
-donations are welcome:
-
-```
-bc1pwy2ulg769ffvhwchk4yzkcq5yq699qwrrkg3a4lq942rj47sutcq2xjny5
 ```
 
 ## License

@@ -80,18 +80,3 @@ async function tick() {
 
 tick();
 setInterval(tick, 10_000);
-
-// Footer donation: click to copy, with a moment of gratitude
-const DONATE_ADDR = "bc1pwy2ulg769ffvhwchk4yzkcq5yq699qwrrkg3a4lq942rj47sutcq2xjny5";
-const donateEl = $("donate");
-const donateDefault = donateEl.innerHTML;
-donateEl.addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText(DONATE_ADDR);
-    donateEl.textContent = "address copied — you absolute legend ♥";
-  } catch {
-    // clipboard blocked (http context): show the full address instead
-    donateEl.innerHTML = `<span class="addr">${DONATE_ADDR}</span>`;
-  }
-  setTimeout(() => { donateEl.innerHTML = donateDefault; }, 3000);
-});

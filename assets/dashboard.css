@@ -148,9 +148,6 @@ footer {
 }
 footer a { color: var(--amber-dim); text-decoration: none; border-bottom: 1px dotted var(--amber-faint); }
 footer a:hover { color: var(--amber); }
-.donate { cursor: pointer; color: var(--amber-dim); transition: color .2s; overflow: hidden; text-overflow: ellipsis; }
-.donate:hover { color: var(--amber); }
-.donate .addr { color: var(--btc); letter-spacing: 0; text-transform: none; }
 @media (max-width: 880px) { .foot-note { display: none; } }
 
 .stale { opacity: .45; transition: opacity .4s; }

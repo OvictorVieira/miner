@@ -95,7 +95,7 @@ impl StatsCache {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
-            .user_agent(concat!("fullsystem-miner/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("community-miner/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("failed to build http client");
         Self {

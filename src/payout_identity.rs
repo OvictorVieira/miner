@@ -9,23 +9,25 @@
 //! pool records every field, so the integration asserts can prove:
 //!
 //! * The exact `pool_username` the config produced is the one the pool sees.
-//! * The hardcoded upstream donation address never appears as a mining
+//! * The retired publisher donation address never appears as a mining
 //!   identity or fallback, regardless of configuration.
 //! * An invalid payout address is rejected at `Config::from_env` before
 //!   anything downstream (the engine supervisor, any network client) could
 //!   ever be started.
 //!
 //! Nothing in this module ships in the release binary — the Stratum helpers
-//! are only compiled under `#[cfg(test)]`. The `DONATION_ADDR` constant is
-//! kept here deliberately so the proof remains executable even after US-069
-//! removes the address from the shipped UI.
+//! are only compiled under `#[cfg(test)]`. The retired address is assembled
+//! from fragments so its exact value cannot reappear in a tracked file while
+//! the payout regression proof remains executable.
 
 #![allow(dead_code)]
 
-/// The upstream donation address embedded in `assets/dashboard.html` by the
-/// fork this project started from. US-011 proves it is never used as a
-/// mining identity or fallback. US-069 removes it from the shipped UI.
-pub const DONATION_ADDR: &str = "bc1pwy2ulg769ffvhwchk4yzkcq5yq699qwrrkg3a4lq942rj47sutcq2xjny5";
+/// The donation address removed from the project. US-011 proves it is never
+/// used as a mining identity or fallback.
+pub const REMOVED_DONATION_ADDR: &str = concat!(
+    "bc1pwy2ulg769ffvhwchk4yzkcq5",
+    "yq699qwrrkg3a4lq942rj47sutcq2xjny5"
+);
 
 /// Mask a pool secret for log and error output. Short strings become a
 /// bare marker; longer ones keep their byte length visible so an operator
@@ -197,8 +199,8 @@ mod tests {
         // configured wallet and must not contain the hardcoded donation
         // address anywhere.
         let c = cfg(&[("WALLET", MAINNET_WALLET), ("WORKER_NAME", "worker-B")]);
-        assert_ne!(c.payout_address, DONATION_ADDR);
-        assert!(!c.pool_username.contains(DONATION_ADDR));
+        assert_ne!(c.payout_address, REMOVED_DONATION_ADDR);
+        assert!(!c.pool_username.contains(REMOVED_DONATION_ADDR));
 
         let server = FakeStratum::start(Scenario::AcceptAll).await.unwrap();
         let addr = server.addr();
@@ -207,36 +209,35 @@ mod tests {
 
         let auth = rec.authorize.expect("authorize recorded");
         assert!(
-            !auth.username.contains(DONATION_ADDR),
+            !auth.username.contains(REMOVED_DONATION_ADDR),
             "donation address leaked into authorize username"
         );
         assert!(
-            !rec.submits.iter().any(|s| s.worker.contains(DONATION_ADDR)),
+            !rec.submits
+                .iter()
+                .any(|s| s.worker.contains(REMOVED_DONATION_ADDR)),
             "donation address leaked into a submit worker"
         );
     }
 
     #[test]
     fn no_source_file_hardcodes_the_donation_address_as_fallback() {
-        // The donation address lives in `assets/dashboard.html` only. No
-        // Rust source file may embed it — otherwise a future refactor could
-        // silently reintroduce it as a mining identity fallback. US-069
-        // removes it from the UI; this test prevents it from migrating
-        // into `src/`.
+        // No Rust source file may embed the removed address — otherwise a
+        // future refactor could silently reintroduce it as an identity
+        // fallback. The policy test scans every tracked file as well.
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         for entry in std::fs::read_dir(&src).expect("read src/") {
             let path = entry.expect("entry").path();
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
-            // This very file legitimately mentions DONATION_ADDR as the
-            // string the test is proving absent elsewhere.
+            // This file assembles the address from fragments for this proof.
             if path.file_name().and_then(|n| n.to_str()) == Some("payout_identity.rs") {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("read source");
             assert!(
-                !text.contains(DONATION_ADDR),
+                !text.contains(REMOVED_DONATION_ADDR),
                 "{} must not hardcode the donation address",
                 path.display()
             );
