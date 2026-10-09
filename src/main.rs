@@ -205,7 +205,28 @@ struct LoginBody {
     password: String,
 }
 
+fn has_json_content_type(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let lowered = value.trim_start().to_ascii_lowercase();
+    lowered == "application/json" || lowered.starts_with("application/json;")
+}
+
 async fn login(State(app): State<SharedApp>, request: Request<Body>) -> Response {
+    if !has_json_content_type(request.headers()) {
+        tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
+        return add_security_headers(
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                Json(serde_json::json!({"error": "content-type must be application/json"})),
+            )
+                .into_response(),
+        );
+    }
     let bytes = match to_bytes(request.into_body(), MAX_LOGIN_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -460,6 +481,73 @@ mod security_headers_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn login_accepts_json_content_type_with_charset() {
+        let response = test_app(Some("hunter2"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "application/json; charset=utf-8")
+                    .body(Body::from(r#"{"password":"hunter2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_missing_content_type_with_415() {
+        let response = test_app(Some("hunter2"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .body(Body::from(r#"{"password":"hunter2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_text_plain_content_type_with_415() {
+        let response = test_app(Some("hunter2"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "text/plain")
+                    .body(Body::from(r#"{"password":"hunter2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_invalid_json_body_with_400() {
+        let response = test_app(Some("hunter2"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_security_headers(&response);
     }
 
