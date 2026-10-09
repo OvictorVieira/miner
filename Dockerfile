@@ -45,7 +45,7 @@ ARG CPUMINER_COMMIT
 LABEL org.opencontainers.image.source="https://github.com/pooler/cpuminer" \
       io.github.cpuminer.commit="${CPUMINER_COMMIT}"
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libcurl4 ca-certificates \
+    libcurl4 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 miner \
     && useradd --system --no-create-home --shell /usr/sbin/nologin \
@@ -58,5 +58,9 @@ COPY --from=app-build /app/target/release/miner /usr/local/bin/miner
 USER 10001:10001
 ENV PORT=3500
 EXPOSE 3500
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl --fail --silent --max-time 2 http://127.0.0.1:3500/health \
+        | grep --quiet --line-regexp '{"status":"ok"}'
 
 CMD ["miner"]

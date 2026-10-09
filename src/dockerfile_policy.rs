@@ -93,4 +93,28 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn healthcheck_uses_only_the_minimal_health_endpoint() {
+        let contents = dockerfile_contents();
+        let healthcheck = contents
+            .split_once("HEALTHCHECK ")
+            .map(|(_, rest)| rest.split("\n\n").next().unwrap_or(rest))
+            .expect("Dockerfile must define a HEALTHCHECK");
+
+        assert!(
+            healthcheck.contains("http://127.0.0.1:3500/health"),
+            "Dockerfile HEALTHCHECK must request only the loopback /health endpoint"
+        );
+        assert!(
+            healthcheck.contains(r#"'{"status":"ok"}'"#),
+            "Dockerfile HEALTHCHECK must verify the exact minimal liveness body"
+        );
+        for forbidden in ["/api/stats", "wallet", "pool", "pid", "restart", "error"] {
+            assert!(
+                !healthcheck.to_ascii_lowercase().contains(forbidden),
+                "Dockerfile HEALTHCHECK contains forbidden detail {forbidden:?}: {healthcheck}"
+            );
+        }
+    }
 }

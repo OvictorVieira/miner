@@ -185,23 +185,10 @@ async fn login_js() -> Response {
     asset_response("text/javascript; charset=utf-8", LOGIN_JS)
 }
 
-async fn health(State(app): State<SharedApp>) -> Response {
-    let s = app.status.read().await;
-    add_security_headers(
-        Json(serde_json::json!({
-            "status": "ok",
-            "miner": {
-                "running": s.running,
-                "pid": s.pid,
-                "restarts": s.restarts,
-                "uptime_seconds": s.started_at
-                    .filter(|_| s.running)
-                    .map(|t| t.elapsed().as_secs()),
-                "last_error": s.last_error,
-            }
-        }))
-        .into_response(),
-    )
+async fn health() -> Response {
+    // Liveness is intentionally independent of miner state. Keep this body
+    // fixed and minimal: process details belong only on /api/stats.
+    add_security_headers(Json(serde_json::json!({"status": "ok"})).into_response())
 }
 
 #[derive(serde::Deserialize)]
@@ -244,10 +231,12 @@ async fn api_stats(State(app): State<SharedApp>, headers: HeaderMap) -> Response
         Json(serde_json::json!({
             "miner": {
                 "running": s.running,
+                "pid": s.pid,
                 "restarts": s.restarts,
                 "uptime_seconds": s.started_at
                     .filter(|_| s.running)
                     .map(|t| t.elapsed().as_secs()),
+                "last_error": s.last_error,
                 "threads": app.cfg.threads(cores),
                 "cores": cores,
                 "power": app.cfg.power,
@@ -334,6 +323,36 @@ mod security_headers_tests {
         let response = get_response(test_app(None), "/health").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn health_is_a_fixed_bounded_liveness_response() {
+        let app = test_app(None);
+        let response = get_response(app, "/health").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_security_headers(&response);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("health must declare its JSON content type");
+        assert_eq!(content_type, "application/json");
+
+        const MAX_HEALTH_BYTES: usize = 32;
+        let body = axum::body::to_bytes(response.into_body(), MAX_HEALTH_BYTES)
+            .await
+            .expect("health response must remain bounded");
+        assert_eq!(body.as_ref(), br#"{"status":"ok"}"#);
+
+        let text = std::str::from_utf8(&body).unwrap();
+        for forbidden in [
+            "miner", "running", "pid", "wallet", "worker", "pool", "error", "restart", "uptime",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "/health leaked forbidden process detail {forbidden:?}: {text}"
+            );
+        }
     }
 
     #[tokio::test]
