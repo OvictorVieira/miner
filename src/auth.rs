@@ -7,8 +7,16 @@ const SESSION_MAX_AGE_SECONDS: u32 = 12 * 60 * 60;
 /// One shared session token per container run, created only when
 /// DASHBOARD_PASSWORD is set. Restarting the container logs everyone out.
 pub struct Auth {
-    // Keep only a fixed-size digest. Constant-time comparison of equal-size
-    // values avoids revealing the first differing byte or password length.
+    // Stores a fixed-size SHA-256 digest of the password, compared in constant
+    // time with the digest of each login attempt. The digest is intentionally
+    // *unsalted*: that is safe here only because this value is held in memory
+    // for the lifetime of the process and is never written to disk, logged,
+    // or sent anywhere. The protection comes entirely from the constant-time
+    // in-memory comparison, not from the hash itself. If this digest ever
+    // leaks (logs, core dumps, future persistence, a crash dump), a weak
+    // password is cheap to recover: SHA-256 of a short string takes
+    // milliseconds. Before persisting or exposing this field in any form,
+    // switch to a password-oriented KDF such as argon2, scrypt, or bcrypt.
     password_digest: Option<[u8; 32]>,
     session_token: String,
 }
