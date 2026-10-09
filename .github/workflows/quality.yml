@@ -40,3 +40,14 @@ jobs:
 
       - name: Run SHA-256d self-test
         run: ./target/release/miner --self-test
+
+  compose-security:
+    name: Compose runtime security inspection
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inspect hardened running container
+        run: tests/compose_security.sh

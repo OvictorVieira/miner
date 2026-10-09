@@ -38,6 +38,41 @@ mod tests {
             .collect()
     }
 
+    fn scalar_value<'a>(lines: &'a [String], key: &str) -> &'a str {
+        let line = lines
+            .iter()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("docker-compose.yml must declare `{key}`"));
+        line.trim_start_matches(key)
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+    }
+
+    #[test]
+    fn image_is_built_locally_and_never_pulled() {
+        let lines = active_lines(&compose_contents());
+        assert_eq!(
+            scalar_value(&lines, "build:"),
+            ".",
+            "miner service must build from the repository root"
+        );
+        assert_eq!(
+            scalar_value(&lines, "pull_policy:"),
+            "never",
+            "Compose must fail instead of pulling an absent image"
+        );
+
+        let image = scalar_value(&lines, "image:");
+        assert!(
+            !image.contains('/'),
+            "local image name must not contain a registry or namespace: {image:?}"
+        );
+        assert!(
+            !image.ends_with(":latest") && image != "latest",
+            "mutable latest tag is forbidden: {image:?}"
+        );
+    }
+
     #[test]
     fn user_is_non_root_numeric() {
         let lines = active_lines(&compose_contents());
@@ -165,6 +200,17 @@ mod tests {
             !lines.iter().any(|l| l.starts_with("volumes:")),
             "no named volumes or bind mounts allowed in the MVP (use tmpfs instead)"
         );
+    }
+
+    #[test]
+    fn no_host_devices_or_device_rules() {
+        let lines = active_lines(&compose_contents());
+        for forbidden in ["devices:", "device_cgroup_rules:"] {
+            assert!(
+                !lines.iter().any(|line| line.starts_with(forbidden)),
+                "{forbidden} is forbidden in the MVP"
+            );
+        }
     }
 
     #[test]

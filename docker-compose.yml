@@ -1,7 +1,11 @@
 services:
   miner:
-    image: ghcr.io/fullsystem/miner:latest
+    # This release is built from the checked-out source only. The deliberately
+    # local image name plus pull_policy: never prevents Compose from falling
+    # back to a registry when the image has not been built yet.
+    image: miner-local:dev
     build: .
+    pull_policy: never
     restart: unless-stopped
     # Non-root numeric UID/GID matches the `miner` user baked into the image.
     user: "10001:10001"
