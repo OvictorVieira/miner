@@ -46,22 +46,52 @@ const LOGIN_FAILURE_DELAY: Duration = Duration::from_millis(200);
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
                    frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
-const SECURITY_HEADERS: &[(&str, &str)] = &[
+// Security headers that MUST be present on every response — static, dynamic,
+// HTML, JSON, and assets alike. CSP, nosniff, X-Frame-Options and Referrer-
+// Policy do not change between route groups, so they live in one list.
+// Cache-Control is handled separately below because it is the one header
+// that legitimately varies by route group.
+const BASE_SECURITY_HEADERS: &[(&str, &str)] = &[
     ("Content-Security-Policy", CSP),
     ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
     ("Referrer-Policy", "no-referrer"),
-    ("Cache-Control", "no-store, max-age=0"),
 ];
 
-fn add_security_headers(mut response: Response) -> Response {
+// Dynamic routes (HTML, /api/*, /health, /logout, /login) must never be cached
+// by anything in the middle: they carry per-session data and short-lived state.
+const CACHE_CONTROL_DYNAMIC: &str = "no-store, max-age=0";
+
+// Static assets (local CSS/JS bundled into the binary at compile time) do not
+// change until the image is rebuilt, so the browser can cache them for the
+// typical dashboard session. `immutable` tells the browser not to revalidate
+// during that window at all.
+const CACHE_CONTROL_ASSET: &str = "public, max-age=3600, immutable";
+
+fn add_base_security_headers(response: &mut Response) {
     let headers = response.headers_mut();
-    for (name, value) in SECURITY_HEADERS {
+    for (name, value) in BASE_SECURITY_HEADERS {
         if let (Ok(header_name), Ok(header_value)) = (
             name.parse::<header::HeaderName>(),
             value.parse::<HeaderValue>(),
         ) {
             headers.insert(header_name, header_value);
         }
+    }
+}
+
+fn add_security_headers(mut response: Response) -> Response {
+    add_base_security_headers(&mut response);
+    if let Ok(value) = CACHE_CONTROL_DYNAMIC.parse::<HeaderValue>() {
+        response.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+    response
+}
+
+fn add_asset_headers(mut response: Response) -> Response {
+    add_base_security_headers(&mut response);
+    if let Ok(value) = CACHE_CONTROL_ASSET.parse::<HeaderValue>() {
+        response.headers_mut().insert(header::CACHE_CONTROL, value);
     }
     response
 }
@@ -174,8 +204,11 @@ async fn index(State(app): State<SharedApp>, headers: HeaderMap) -> Response {
 
 // Local-only assets: styles and scripts are embedded at compile time and
 // served from this origin, so the strict CSP needs no inline allowance.
+// Assets carry a long, immutable Cache-Control instead of the dynamic
+// `no-store`, so a dashboard reload does not redownload a CSS/JS that has
+// not changed. Every other security header stays identical.
 fn asset_response(content_type: &'static str, body: &'static str) -> Response {
-    add_security_headers(([(header::CONTENT_TYPE, content_type)], body).into_response())
+    add_asset_headers(([(header::CONTENT_TYPE, content_type)], body).into_response())
 }
 
 async fn dashboard_css() -> Response {
@@ -350,12 +383,28 @@ mod security_headers_tests {
             .with_state(app)
     }
 
-    fn assert_security_headers(response: &Response) {
+    fn assert_base_security_headers(response: &Response) {
         let headers = response.headers();
         assert_eq!(headers.get("content-security-policy").unwrap(), CSP);
         assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
         assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
-        assert_eq!(headers.get("cache-control").unwrap(), "no-store, max-age=0");
+    }
+
+    fn assert_security_headers(response: &Response) {
+        assert_base_security_headers(response);
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            CACHE_CONTROL_DYNAMIC
+        );
+    }
+
+    fn assert_asset_headers(response: &Response) {
+        assert_base_security_headers(response);
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            CACHE_CONTROL_ASSET
+        );
     }
 
     async fn get_response(app: Router, uri: &str) -> Response {
@@ -656,18 +705,49 @@ mod security_headers_tests {
         names
     }
 
+    /// A subresource `src=`/`href=` value is same-origin only if it is empty,
+    /// an in-page anchor (`#foo`), a root-relative path that is NOT a
+    /// protocol-relative URL (`//evil.example/x.css` would otherwise sneak
+    /// past a bare `starts_with('/')` check), or a `data:` URI.
+    fn is_same_origin_subresource(value: &str) -> bool {
+        if value.is_empty() || value.starts_with('#') || value.starts_with("data:") {
+            return true;
+        }
+        value.starts_with('/') && !value.starts_with("//")
+    }
+
     /// `src=`/`href=` values declared on a tag (quotes stripped).
+    ///
+    /// Anchors the match on whitespace (or tag start) + attribute name + `=`,
+    /// so a `data-src=`/`data-href=`/`xlink:href=` added to the HTML later
+    /// does not get picked up as a real subresource and trip the policy
+    /// assertions with a confusing failure.
     fn subresource_values(tag: &str) -> Vec<String> {
         let mut values = Vec::new();
+        let bytes = tag.as_bytes();
         for attr in ["src=", "href="] {
-            for piece in tag.split(attr).skip(1) {
-                let piece = piece.trim_start_matches(['"', '\'']);
-                values.push(
-                    piece
-                        .chars()
-                        .take_while(|c| !matches!(c, '"' | '\'' | '>' | ' ' | '\t' | '\n'))
-                        .collect(),
-                );
+            let needle = attr.as_bytes();
+            let mut i = 0;
+            while i + needle.len() <= bytes.len() {
+                if &bytes[i..i + needle.len()] == needle {
+                    // Attribute name must stand on its own: the byte before it
+                    // is either the start of the tag or ASCII whitespace. This
+                    // rejects `data-src=`, `data-href=`, `xlink:href=`, and
+                    // anything else that just happens to end in `src=`/`href=`.
+                    let anchored = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r');
+                    if anchored {
+                        let after = &tag[i + needle.len()..];
+                        let after = after.trim_start_matches(['"', '\'']);
+                        let value: String = after
+                            .chars()
+                            .take_while(|c| !matches!(c, '"' | '\'' | '>' | ' ' | '\t' | '\n'))
+                            .collect();
+                        values.push(value);
+                        i += needle.len();
+                        continue;
+                    }
+                }
+                i += 1;
             }
         }
         values
@@ -692,10 +772,7 @@ mod security_headers_tests {
                 }
                 for value in subresource_values(&tag) {
                     assert!(
-                        value.is_empty()
-                            || value.starts_with('#')
-                            || value.starts_with('/')
-                            || value.starts_with("data:"),
+                        is_same_origin_subresource(&value),
                         "{name} loads a third-party subresource: <{tag_name}> {value}"
                     );
                 }
@@ -769,7 +846,7 @@ mod security_headers_tests {
         ] {
             let response = get_response(test_app(None), uri).await;
             assert_eq!(response.status(), StatusCode::OK, "{uri}");
-            assert_security_headers(&response);
+            assert_asset_headers(&response);
             let ct = response
                 .headers()
                 .get("content-type")
@@ -805,6 +882,144 @@ mod security_headers_tests {
                         response.status(),
                         StatusCode::OK,
                         "{name} references {value}, which is not served"
+                    );
+                }
+            }
+        }
+    }
+
+    /// US-077: static assets must carry a long, immutable Cache-Control so a
+    /// dashboard reload does not redownload unchanged CSS/JS. The base
+    /// security headers stay identical to dynamic routes.
+    #[tokio::test]
+    async fn static_assets_use_long_immutable_cache() {
+        for uri in [
+            "/assets/dashboard.css",
+            "/assets/dashboard.js",
+            "/assets/login.css",
+            "/assets/login.js",
+        ] {
+            let response = get_response(test_app(None), uri).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let cache_control = response
+                .headers()
+                .get("cache-control")
+                .unwrap_or_else(|| panic!("{uri} must set Cache-Control"))
+                .to_str()
+                .unwrap();
+            assert!(
+                cache_control.contains("max-age=3600"),
+                "{uri}: Cache-Control {cache_control} must contain max-age=3600"
+            );
+            assert!(
+                cache_control.contains("immutable"),
+                "{uri}: Cache-Control {cache_control} must contain immutable"
+            );
+            // Base security headers stay present on cacheable assets.
+            assert_base_security_headers(&response);
+            assert_eq!(
+                response.headers().get("content-security-policy").unwrap(),
+                CSP
+            );
+        }
+    }
+
+    /// US-077: every dynamic route must stay `no-store` so a cache in the
+    /// middle cannot stash per-session JSON or an HTML page carrying session
+    /// cookies.
+    #[tokio::test]
+    async fn dynamic_routes_use_no_store() {
+        for uri in ["/", "/health", "/api/stats"] {
+            let response = get_response(test_app(None), uri).await;
+            assert_eq!(
+                response.headers().get("cache-control").unwrap(),
+                CACHE_CONTROL_DYNAMIC,
+                "{uri} must send no-store"
+            );
+            assert_base_security_headers(&response);
+        }
+    }
+
+    /// US-077: the published Cache-Control constants are the exact strings
+    /// the policy document promises. Any accidental drift (`max-age=0` on an
+    /// asset, `must-revalidate` on no-store) fails here instead of in the
+    /// field.
+    #[test]
+    fn cache_control_constants_are_fixed() {
+        assert_eq!(CACHE_CONTROL_DYNAMIC, "no-store, max-age=0");
+        assert_eq!(CACHE_CONTROL_ASSET, "public, max-age=3600, immutable");
+    }
+
+    /// US-079: the subresource extractor must only match whitespace-anchored
+    /// `src=`/`href=`, so `data-src=`/`data-href=` added to the HTML later
+    /// cannot produce a false positive, while any real external URL still
+    /// gets caught.
+    #[test]
+    fn subresource_values_ignores_data_prefixed_attributes() {
+        // Real src/href: picked up.
+        assert_eq!(
+            subresource_values("<link href=\"/assets/x.css\">"),
+            vec!["/assets/x.css".to_string()],
+        );
+        assert_eq!(
+            subresource_values("<script src=\"/assets/y.js\" defer></script>"),
+            vec!["/assets/y.js".to_string()],
+        );
+
+        // `data-src`/`data-href` must be ignored outright.
+        assert!(
+            subresource_values("<div data-src=\"/foo.json\"></div>").is_empty(),
+            "data-src must not be picked up as a subresource"
+        );
+        assert!(
+            subresource_values("<div data-href=\"/bar\"></div>").is_empty(),
+            "data-href must not be picked up as a subresource"
+        );
+
+        // A real external URL still gets caught.
+        assert_eq!(
+            subresource_values("<script src=\"https://cdn.example.com/x.js\"></script>"),
+            vec!["https://cdn.example.com/x.js".to_string()],
+        );
+        assert_eq!(
+            subresource_values("<link href=\"//evil.example/x.css\" rel=\"stylesheet\">"),
+            vec!["//evil.example/x.css".to_string()],
+        );
+    }
+
+    /// US-079: synthetic HTML drives the policy check that
+    /// `assets_reference_no_third_party_subresources` is built on, so the
+    /// test is anchored on realistic shapes rather than only the shipping
+    /// pages.
+    #[test]
+    fn third_party_subresource_rule_covers_external_values_and_skips_data_attrs() {
+        let bad = [
+            "<script src=\"https://cdn.example.com/x.js\"></script>",
+            "<link href=\"//evil.example/x.css\" rel=\"stylesheet\">",
+        ];
+        for html in bad {
+            let mut flagged = false;
+            for tag in tags_of(html) {
+                for value in subresource_values(&tag) {
+                    if !is_same_origin_subresource(&value) {
+                        flagged = true;
+                    }
+                }
+            }
+            assert!(flagged, "external subresource must be flagged: {html}");
+        }
+
+        let good = [
+            "<div data-src=\"/foo.json\" data-href=\"/bar\"></div>",
+            "<link href=\"/assets/x.css\" rel=\"stylesheet\">",
+            "<script src=\"/assets/y.js\" defer></script>",
+        ];
+        for html in good {
+            for tag in tags_of(html) {
+                for value in subresource_values(&tag) {
+                    assert!(
+                        is_same_origin_subresource(&value),
+                        "false positive: {html} value={value}"
                     );
                 }
             }
