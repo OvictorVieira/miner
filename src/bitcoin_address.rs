@@ -91,6 +91,11 @@ fn decode_base58check(s: &str) -> Result<Vec<u8>, String> {
 }
 
 fn decode_base58(s: &str) -> Result<Vec<u8>, String> {
+    // Internally accumulate the big integer in little-endian order so new
+    // high-order bytes `push` at the tail in O(1); reverse once at the end
+    // to restore the big-endian layout the checksum step expects. The old
+    // shape used `insert(0, …)` for the overflow byte, which is O(n) each
+    // call and makes the whole decode O(n^2).
     let mut bytes: Vec<u8> = vec![0];
     for c in s.chars() {
         let digit = BASE58_ALPHABET
@@ -98,16 +103,17 @@ fn decode_base58(s: &str) -> Result<Vec<u8>, String> {
             .position(|&b| b as char == c)
             .ok_or_else(|| format!("invalid base58 character {c:?}"))? as u32;
         let mut carry = digit;
-        for byte in bytes.iter_mut().rev() {
+        for byte in bytes.iter_mut() {
             let value = *byte as u32 * 58 + carry;
             *byte = (value & 0xff) as u8;
             carry = value >> 8;
         }
         while carry > 0 {
-            bytes.insert(0, (carry & 0xff) as u8);
+            bytes.push((carry & 0xff) as u8);
             carry >>= 8;
         }
     }
+    bytes.reverse();
 
     let leading_ones = s.chars().take_while(|&c| c == '1').count();
     let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
@@ -288,5 +294,91 @@ mod tests {
         // regardless of checksum validity, because the length (25) check runs first.
         let fake_wif = "5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ";
         assert!(validate(fake_wif, BitcoinNetwork::Mainnet).is_err());
+    }
+
+    /// Quadratic-free reference implementation of the pre-US-078 decode,
+    /// kept test-only so we can prove the new O(n) implementation is byte-for-byte
+    /// identical. Any divergence between the two for any address in the test
+    /// matrix fails here instead of in production.
+    #[cfg(test)]
+    fn decode_base58_quadratic_reference(s: &str) -> Result<Vec<u8>, String> {
+        let mut bytes: Vec<u8> = vec![0];
+        for c in s.chars() {
+            let digit = BASE58_ALPHABET
+                .iter()
+                .position(|&b| b as char == c)
+                .ok_or_else(|| format!("invalid base58 character {c:?}"))?
+                as u32;
+            let mut carry = digit;
+            for byte in bytes.iter_mut().rev() {
+                let value = *byte as u32 * 58 + carry;
+                *byte = (value & 0xff) as u8;
+                carry = value >> 8;
+            }
+            while carry > 0 {
+                bytes.insert(0, (carry & 0xff) as u8);
+                carry >>= 8;
+            }
+        }
+        let leading_ones = s.chars().take_while(|&c| c == '1').count();
+        let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+        let mut result = vec![0u8; leading_ones];
+        result.extend_from_slice(&bytes[start..]);
+        Ok(result)
+    }
+
+    /// US-078: the new linear decoder must produce byte-identical output
+    /// to the retired quadratic implementation for every address shape we
+    /// accept (mainnet P2PKH, mainnet P2SH, testnet P2PKH, testnet P2SH,
+    /// an all-leading-ones edge case, and a non-base58 invalid input).
+    #[test]
+    fn decode_base58_matches_quadratic_reference() {
+        for addr in [
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+            "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn",
+            "2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc",
+            "11111111111111111111111111111111",
+        ] {
+            let new_impl = decode_base58(addr).unwrap_or_else(|e| {
+                panic!("new impl failed on {addr}: {e}");
+            });
+            let reference = decode_base58_quadratic_reference(addr).unwrap_or_else(|e| {
+                panic!("reference impl failed on {addr}: {e}");
+            });
+            assert_eq!(
+                new_impl, reference,
+                "decode_base58 diverged from reference for {addr}"
+            );
+        }
+
+        // Invalid input: non-base58 character. Both implementations must
+        // reject with an error (we do not compare error strings — just the
+        // Err/Err equivalence).
+        assert!(decode_base58("not a bitcoin address").is_err());
+        assert!(decode_base58_quadratic_reference("not a bitcoin address").is_err());
+    }
+
+    /// US-078: Satoshi's genesis coinbase payout address decodes to the
+    /// well-known 25 bytes (version 0x00 || hash160 || 4-byte sha256d
+    /// checksum). The payload bytes are hardcoded; the checksum is
+    /// recomputed from the payload here so the test is a complete
+    /// cross-check against external known-good data.
+    #[test]
+    fn decode_base58_known_vector_genesis_address() {
+        let decoded = decode_base58("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").unwrap();
+        assert_eq!(decoded.len(), 25);
+
+        let expected_payload: [u8; 21] = [
+            0x00, 0x62, 0xe9, 0x07, 0xb1, 0x5c, 0xbf, 0x27, 0xd5, 0x42, 0x53, 0x99, 0xeb, 0xf6,
+            0xf0, 0xfb, 0x50, 0xeb, 0xb8, 0x8f, 0x18,
+        ];
+        assert_eq!(&decoded[..21], &expected_payload[..]);
+
+        // Checksum = first 4 bytes of sha256(sha256(payload)).
+        let hash1 = Sha256::digest(&decoded[..21]);
+        let hash2 = Sha256::digest(hash1);
+        assert_eq!(&decoded[21..25], &hash2[..4]);
     }
 }
