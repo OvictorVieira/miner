@@ -51,7 +51,10 @@ impl Auth {
         cookies
             .split(';')
             .filter_map(|c| c.trim().split_once('='))
-            .any(|(name, value)| name == "session" && value == self.session_token)
+            .any(|(name, value)| {
+                name == "session"
+                    && bool::from(value.as_bytes().ct_eq(self.session_token.as_bytes()))
+            })
     }
 
     pub fn cookie(&self) -> String {
@@ -107,5 +110,36 @@ mod tests {
         let auth = Auth::new(Some("hunter2".into()));
         assert!(auth.cookie().contains("Max-Age=43200"));
         assert!(!auth.cookie().contains("2592000"));
+    }
+
+    #[test]
+    fn correct_cookie_authorizes() {
+        let auth = Auth::new(Some("hunter2".into()));
+        let token = auth.login("hunter2").unwrap();
+        assert!(auth.is_authorized(Some(&format!("session={token}"))));
+    }
+
+    #[test]
+    fn one_byte_different_cookie_is_rejected() {
+        let auth = Auth::new(Some("hunter2".into()));
+        let token = auth.login("hunter2").unwrap().to_string();
+        let mut forged = token.clone().into_bytes();
+        forged[0] = if forged[0] == b'0' { b'1' } else { b'0' };
+        let forged = String::from_utf8(forged).unwrap();
+        assert!(!auth.is_authorized(Some(&format!("session={forged}"))));
+    }
+
+    #[test]
+    fn empty_cookie_is_rejected() {
+        let auth = Auth::new(Some("hunter2".into()));
+        assert!(!auth.is_authorized(Some("session=")));
+    }
+
+    #[test]
+    fn different_length_cookie_is_rejected() {
+        let auth = Auth::new(Some("hunter2".into()));
+        let token = auth.login("hunter2").unwrap();
+        assert!(!auth.is_authorized(Some(&format!("session={}", &token[..token.len() - 1]))));
+        assert!(!auth.is_authorized(Some(&format!("session={token}0"))));
     }
 }
