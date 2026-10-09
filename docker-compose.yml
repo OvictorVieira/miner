@@ -1,19 +1,84 @@
 services:
   miner:
-    image: ghcr.io/fullsystem/miner:latest
+    # This release is built from the checked-out source only. The deliberately
+    # local image name plus pull_policy: never prevents Compose from falling
+    # back to a registry when the image has not been built yet.
+    image: miner-local:dev
     build: .
+    pull_policy: never
     restart: unless-stopped
+    # Non-root numeric UID/GID matches the `miner` user baked into the image.
+    user: "10001:10001"
+    # Immutable root filesystem — only the explicit tmpfs below is writable.
+    read_only: true
+    # Drop every Linux capability. The miner needs none.
+    cap_drop:
+      - ALL
+    # Keep Docker's default seccomp profile active (never seccomp=unconfined)
+    # and forbid gaining new privileges via setuid/setgid binaries.
+    security_opt:
+      - no-new-privileges:true
+    # Do NOT enable privileged mode and do NOT share host namespaces.
+    # These lines are intentionally commented so a reviewer sees them.
+    # privileged: false            # (default — never set to true)
+    # pid: host                    # (never)
+    # ipc: host                    # (never)
+    # network: host                # (never)
+    # userns_mode: host            # (never)
+    # No named volume and no host bind mount in the MVP — the container must
+    # not reach outside its own filesystem. The one writable area is a
+    # bounded tmpfs for libcurl / glibc scratch space.
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    # Hard CPU cap. Default: 2.0 whole CPUs — a conservative, documented
+    # share of a modern host that leaves cores for the rest of the system.
+    # The miner's POWER (1-100) still applies on top: threads are
+    # `min(cores * POWER / 100, CPU_LIMIT)` so the engine never launches
+    # more worker threads than the host can give it.
+    cpus: "${CPU_LIMIT:-2.0}"
+    # Hard memory ceiling. The engine's working set is tiny; this cap
+    # exists so a leak or runaway allocation gets OOM-killed instead of
+    # swapping the host to death.
+    mem_limit: 512m
+    mem_reservation: 128m
+    # Bound process count — a fork bomb inside the container is contained.
+    pids_limit: 128
+    ulimits:
+      # Disable core dumps in the release service: a crash must not
+      # write process memory (which may contain pool credentials) to disk.
+      core: 0
+      # Cap open file descriptors. The miner only needs a handful.
+      nofile:
+        soft: 1024
+        hard: 1024
+    # Bounded Docker log rotation — stdout/stderr can never fill the host
+    # disk. 10 MiB per file × 5 files = 50 MiB per container at most.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # Dashboard is published on the host's loopback interface only.
+    # Remote/LAN access is explicitly out of scope in this MVP (see
+    # SECURITY.md, US-036). The container-side bind to 0.0.0.0 is safe
+    # ONLY because this publication address is 127.0.0.1 — never change
+    # the host side to 0.0.0.0, a LAN IP, or ::. DASHBOARD_PASSWORD below is
+    # local defense in depth and does not make remote exposure safe.
     ports:
-      - "3500:3500"
+      - "127.0.0.1:3500:3500"
     environment:
+      # Tells the Rust supervisor it is running inside a container, so the
+      # dashboard may bind to 0.0.0.0 (otherwise it refuses non-loopback).
+      IN_CONTAINER: "1"
       # Your BTC wallet — the only required variable
       WALLET: ${WALLET:?Set WALLET in .env}
       # Percentage of CPU cores used by the miner (1-100)
       POWER: ${POWER:-50}
       # Worker name shown at the pool (useful with multiple instances)
       WORKER_NAME: ${WORKER_NAME:-miner}
-      # Dashboard password; without it the panel is public read-only
+      # Mirrors the `cpus:` cap above so the Rust supervisor caps worker
+      # threads to the same whole-core budget Docker enforces.
+      CPU_LIMIT: ${CPU_LIMIT:-2}
+      # Optional local-dashboard defense in depth. This does NOT make LAN or
+      # internet exposure safe; keep the loopback-only ports mapping above.
       # DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
-    # Hard CPU cap for the whole container, on top of POWER — plays nice
-    # with other projects on the same box:
-    # cpus: "2.0"

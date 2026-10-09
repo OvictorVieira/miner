@@ -1,13 +1,24 @@
 mod auth;
+mod bitcoin_address;
+mod ci_policy;
+mod compose_policy;
 mod config;
+mod cpuminer_policy;
+mod dockerfile_policy;
+mod fake_stratum;
+mod fork_identity_policy;
 mod miner;
+mod payout_identity;
+mod readme_policy;
+mod sha256d_self_test;
 mod stats;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
+    body::{to_bytes, Body},
     extract::State,
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -16,7 +27,74 @@ use miner::SharedStatus;
 use tokio::sync::{watch, RwLock};
 
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
+const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
+const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
 const LOGIN_HTML: &str = include_str!("../assets/login.html");
+const LOGIN_CSS: &str = include_str!("../assets/login.css");
+const LOGIN_JS: &str = include_str!("../assets/login.js");
+
+const MAX_LOGIN_BODY_BYTES: usize = 1024;
+// Every rejected login pays the same delay. This slows online guessing with
+// no attacker-controlled keys or other growing in-memory state.
+const LOGIN_FAILURE_DELAY: Duration = Duration::from_millis(200);
+
+// Every directive the pages need to work is `'self'` — the HTML ships its
+// styles and scripts as local assets, so no inline/external allowance exists.
+// `default-src 'self'` is what makes viewing the dashboard cause no
+// third-party request (US-040); explicit script/style sources document that
+// inline code is intentionally rejected.
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+                   frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
+// Security headers that MUST be present on every response — static, dynamic,
+// HTML, JSON, and assets alike. CSP, nosniff, X-Frame-Options and Referrer-
+// Policy do not change between route groups, so they live in one list.
+// Cache-Control is handled separately below because it is the one header
+// that legitimately varies by route group.
+const BASE_SECURITY_HEADERS: &[(&str, &str)] = &[
+    ("Content-Security-Policy", CSP),
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+];
+
+// Dynamic routes (HTML, /api/*, /health, /logout, /login) must never be cached
+// by anything in the middle: they carry per-session data and short-lived state.
+const CACHE_CONTROL_DYNAMIC: &str = "no-store, max-age=0";
+
+// Static assets (local CSS/JS bundled into the binary at compile time) do not
+// change until the image is rebuilt, so the browser can cache them for the
+// typical dashboard session. `immutable` tells the browser not to revalidate
+// during that window at all.
+const CACHE_CONTROL_ASSET: &str = "public, max-age=3600, immutable";
+
+fn add_base_security_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    for (name, value) in BASE_SECURITY_HEADERS {
+        if let (Ok(header_name), Ok(header_value)) = (
+            name.parse::<header::HeaderName>(),
+            value.parse::<HeaderValue>(),
+        ) {
+            headers.insert(header_name, header_value);
+        }
+    }
+}
+
+fn add_security_headers(mut response: Response) -> Response {
+    add_base_security_headers(&mut response);
+    if let Ok(value) = CACHE_CONTROL_DYNAMIC.parse::<HeaderValue>() {
+        response.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+    response
+}
+
+fn add_asset_headers(mut response: Response) -> Response {
+    add_base_security_headers(&mut response);
+    if let Ok(value) = CACHE_CONTROL_ASSET.parse::<HeaderValue>() {
+        response.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+    response
+}
 
 struct App {
     cfg: config::Config,
@@ -29,6 +107,19 @@ type SharedApp = Arc<App>;
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().skip(1).any(|a| a == "--self-test") {
+        match sha256d_self_test::run() {
+            Ok(()) => {
+                println!("sha256d self-test: OK");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("sha256d self-test: FAIL\n{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     tracing_subscriber::fmt().with_target(false).init();
 
     let cfg = match config::Config::from_env() {
@@ -60,11 +151,20 @@ async fn main() {
         .route("/health", get(health))
         .route("/api/login", post(login))
         .route("/api/stats", get(api_stats))
+        .route("/assets/dashboard.css", get(dashboard_css))
+        .route("/assets/dashboard.js", get(dashboard_js))
+        .route("/assets/login.css", get(login_css))
+        .route("/assets/login.js", get(login_js))
         .with_state(app.clone());
 
-    let addr = format!("0.0.0.0:{}", app.cfg.port);
-    tracing::info!("dashboard listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(&addr)
+    let addr = std::net::SocketAddr::new(app.cfg.bind_address, app.cfg.port);
+    let policy = if app.cfg.bind_address.is_loopback() {
+        "loopback-only"
+    } else {
+        "wildcard (container; host publishes 127.0.0.1 only)"
+    };
+    tracing::info!("dashboard listening on http://{addr} (bind policy: {policy})");
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind port");
 
@@ -93,28 +193,44 @@ fn cookie_header(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
 }
 
-async fn index(State(app): State<SharedApp>, headers: HeaderMap) -> Html<&'static str> {
-    if app.auth.is_authorized(cookie_header(&headers)) {
-        Html(DASHBOARD_HTML)
+async fn index(State(app): State<SharedApp>, headers: HeaderMap) -> Response {
+    let html = if app.auth.is_authorized(cookie_header(&headers)) {
+        DASHBOARD_HTML
     } else {
-        Html(LOGIN_HTML)
-    }
+        LOGIN_HTML
+    };
+    add_security_headers(Html(html).into_response())
 }
 
-async fn health(State(app): State<SharedApp>) -> Json<serde_json::Value> {
-    let s = app.status.read().await;
-    Json(serde_json::json!({
-        "status": "ok",
-        "miner": {
-            "running": s.running,
-            "pid": s.pid,
-            "restarts": s.restarts,
-            "uptime_seconds": s.started_at
-                .filter(|_| s.running)
-                .map(|t| t.elapsed().as_secs()),
-            "last_error": s.last_error,
-        }
-    }))
+// Local-only assets: styles and scripts are embedded at compile time and
+// served from this origin, so the strict CSP needs no inline allowance.
+// Assets carry a long, immutable Cache-Control instead of the dynamic
+// `no-store`, so a dashboard reload does not redownload a CSS/JS that has
+// not changed. Every other security header stays identical.
+fn asset_response(content_type: &'static str, body: &'static str) -> Response {
+    add_asset_headers(([(header::CONTENT_TYPE, content_type)], body).into_response())
+}
+
+async fn dashboard_css() -> Response {
+    asset_response("text/css; charset=utf-8", DASHBOARD_CSS)
+}
+
+async fn dashboard_js() -> Response {
+    asset_response("text/javascript; charset=utf-8", DASHBOARD_JS)
+}
+
+async fn login_css() -> Response {
+    asset_response("text/css; charset=utf-8", LOGIN_CSS)
+}
+
+async fn login_js() -> Response {
+    asset_response("text/javascript; charset=utf-8", LOGIN_JS)
+}
+
+async fn health() -> Response {
+    // Liveness is intentionally independent of miner state. Keep this body
+    // fixed and minimal: process details belong only on /api/stats.
+    add_security_headers(Json(serde_json::json!({"status": "ok"})).into_response())
 }
 
 #[derive(serde::Deserialize)]
@@ -122,48 +238,791 @@ struct LoginBody {
     password: String,
 }
 
-async fn login(State(app): State<SharedApp>, Json(body): Json<LoginBody>) -> Response {
+fn has_json_content_type(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let lowered = value.trim_start().to_ascii_lowercase();
+    lowered == "application/json" || lowered.starts_with("application/json;")
+}
+
+async fn login(State(app): State<SharedApp>, request: Request<Body>) -> Response {
+    if !has_json_content_type(request.headers()) {
+        tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
+        return add_security_headers(
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                Json(serde_json::json!({"error": "content-type must be application/json"})),
+            )
+                .into_response(),
+        );
+    }
+    let bytes = match to_bytes(request.into_body(), MAX_LOGIN_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
+            return add_security_headers(
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(serde_json::json!({"error": "login request too large"})),
+                )
+                    .into_response(),
+            );
+        }
+    };
+    let body: LoginBody = match serde_json::from_slice(&bytes) {
+        Ok(body) => body,
+        Err(_) => {
+            tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
+            return add_security_headers(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid login request"})),
+                )
+                    .into_response(),
+            );
+        }
+    };
+
     match app.auth.login(&body.password) {
-        Some(_) => (
-            StatusCode::OK,
-            [(header::SET_COOKIE, app.auth.cookie())],
-            Json(serde_json::json!({"ok": true})),
-        )
-            .into_response(),
-        None => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "wrong password"})),
-        )
-            .into_response(),
+        Some(_) => add_security_headers(
+            (
+                StatusCode::OK,
+                [(header::SET_COOKIE, app.auth.cookie())],
+                Json(serde_json::json!({"ok": true})),
+            )
+                .into_response(),
+        ),
+        None => {
+            tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
+            add_security_headers(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "wrong password"})),
+                )
+                    .into_response(),
+            )
+        }
     }
 }
 
 async fn api_stats(State(app): State<SharedApp>, headers: HeaderMap) -> Response {
     if !app.auth.is_authorized(cookie_header(&headers)) {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return add_security_headers(StatusCode::UNAUTHORIZED.into_response());
     }
 
-    let (pool, network) = app.cache.get(&app.cfg.wallet).await;
+    let (pool, network) = app.cache.get(&app.cfg.payout_address).await;
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
 
     let s = app.status.read().await;
-    Json(serde_json::json!({
-        "miner": {
-            "running": s.running,
-            "restarts": s.restarts,
-            "uptime_seconds": s.started_at
-                .filter(|_| s.running)
-                .map(|t| t.elapsed().as_secs()),
-            "threads": app.cfg.threads(cores),
-            "cores": cores,
-            "power": app.cfg.power,
-            "worker": app.cfg.stratum_user(),
-            "pool_url": app.cfg.pool_url,
-        },
-        "pool": pool,
-        "network": network,
-    }))
-    .into_response()
+    add_security_headers(
+        Json(serde_json::json!({
+            "miner": {
+                "running": s.running,
+                "pid": s.pid,
+                "restarts": s.restarts,
+                "uptime_seconds": s.started_at
+                    .filter(|_| s.running)
+                    .map(|t| t.elapsed().as_secs()),
+                "last_error": s.last_error,
+                "threads": app.cfg.threads(cores),
+                "cores": cores,
+                "power": app.cfg.power,
+                "worker": app.cfg.pool_username,
+                "pool_url": app.cfg.pool_url,
+            },
+            "pool": pool,
+            "network": network,
+        }))
+        .into_response(),
+    )
+}
+
+#[cfg(test)]
+mod security_headers_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        Router,
+    };
+    use tower::util::ServiceExt;
+
+    fn test_cfg() -> config::Config {
+        config::Config::from_vars(|k| {
+            (k == "WALLET").then(|| "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string())
+        })
+        .expect("test config must load")
+    }
+
+    /// `password` is always `Some` for API routes that would otherwise take
+    /// the authorized path: an authorized `/api/stats` fetches mempool.space,
+    /// and these tests must stay offline.
+    fn test_app(password: Option<&str>) -> Router {
+        let status: SharedStatus = Arc::new(RwLock::new(miner::MinerStatus::default()));
+        let app = Arc::new(App {
+            auth: auth::Auth::new(password.map(str::to_string)),
+            cache: stats::StatsCache::new(),
+            status,
+            cfg: test_cfg(),
+        });
+        Router::new()
+            .route("/", get(index))
+            .route("/health", get(health))
+            .route("/api/login", post(login))
+            .route("/api/stats", get(api_stats))
+            .route("/assets/dashboard.css", get(dashboard_css))
+            .route("/assets/dashboard.js", get(dashboard_js))
+            .route("/assets/login.css", get(login_css))
+            .route("/assets/login.js", get(login_js))
+            .with_state(app)
+    }
+
+    fn assert_base_security_headers(response: &Response) {
+        let headers = response.headers();
+        assert_eq!(headers.get("content-security-policy").unwrap(), CSP);
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+    }
+
+    fn assert_security_headers(response: &Response) {
+        assert_base_security_headers(response);
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            CACHE_CONTROL_DYNAMIC
+        );
+    }
+
+    fn assert_asset_headers(response: &Response) {
+        assert_base_security_headers(response);
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            CACHE_CONTROL_ASSET
+        );
+    }
+
+    async fn get_response(app: Router, uri: &str) -> Response {
+        app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_dashboard() {
+        let response = get_response(test_app(None), "/").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_login_page() {
+        let response = get_response(test_app(Some("hunter2")), "/").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_health() {
+        let response = get_response(test_app(None), "/health").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn health_is_a_fixed_bounded_liveness_response() {
+        let app = test_app(None);
+        let response = get_response(app, "/health").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_security_headers(&response);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("health must declare its JSON content type");
+        assert_eq!(content_type, "application/json");
+
+        const MAX_HEALTH_BYTES: usize = 32;
+        let body = axum::body::to_bytes(response.into_body(), MAX_HEALTH_BYTES)
+            .await
+            .expect("health response must remain bounded");
+        assert_eq!(body.as_ref(), br#"{"status":"ok"}"#);
+
+        let text = std::str::from_utf8(&body).unwrap();
+        for forbidden in [
+            "miner", "running", "pid", "wallet", "worker", "pool", "error", "restart", "uptime",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "/health leaked forbidden process detail {forbidden:?}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_api_login_rejection() {
+        let app = test_app(Some("hunter2"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"wrong"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_security_headers(&response);
+    }
+
+    async fn login_response(app: Router, password: &str) -> Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"password": password}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn login_accepts_correct_password_and_sets_twelve_hour_cookie() {
+        let response = login_response(test_app(Some("hunter2")), "hunter2").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_security_headers(&response);
+        let cookie = response.headers().get(header::SET_COOKIE).unwrap();
+        assert!(cookie.to_str().unwrap().contains("Max-Age=43200"));
+    }
+
+    #[tokio::test]
+    async fn login_rejects_wrong_and_empty_passwords() {
+        for attempt in ["wrong", ""] {
+            let response = login_response(test_app(Some("hunter2")), attempt).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_security_headers(&response);
+        }
+    }
+
+    #[tokio::test]
+    async fn login_rejects_oversized_body() {
+        let oversized = format!(r#"{{"password":"{}"}}"#, "x".repeat(MAX_LOGIN_BODY_BYTES));
+        let response = test_app(Some("hunter2"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn login_accepts_json_content_type_with_charset() {
+        let response = test_app(Some("hunter2"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "application/json; charset=utf-8")
+                    .body(Body::from(r#"{"password":"hunter2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_missing_content_type_with_415() {
+        let response = test_app(Some("hunter2"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .body(Body::from(r#"{"password":"hunter2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_text_plain_content_type_with_415() {
+        let response = test_app(Some("hunter2"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "text/plain")
+                    .body(Body::from(r#"{"password":"hunter2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_invalid_json_body_with_400() {
+        let response = test_app(Some("hunter2"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_logins_are_uniformly_delayed() {
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            let response = login_response(test_app(Some("hunter2")), "wrong").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(
+            started.elapsed() >= LOGIN_FAILURE_DELAY * 3,
+            "every failed attempt must pay the configured delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_api_stats_unauthorized() {
+        let response = get_response(test_app(Some("hunter2")), "/api/stats").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_security_headers(&response);
+    }
+
+    /// Every asset the pages load — all served from this origin.
+    const ASSETS: [(&str, &str); 6] = [
+        ("dashboard.html", DASHBOARD_HTML),
+        ("dashboard.css", DASHBOARD_CSS),
+        ("dashboard.js", DASHBOARD_JS),
+        ("login.html", LOGIN_HTML),
+        ("login.css", LOGIN_CSS),
+        ("login.js", LOGIN_JS),
+    ];
+
+    /// Every `<...>` tag in document order. Raw-text element content is
+    /// skipped so code like `i < units.length` is never parsed as a tag.
+    fn tags_of(html: &str) -> Vec<String> {
+        let mut tags = Vec::new();
+        let mut rest = html;
+        while let Some(start) = rest.find('<') {
+            let Some(end) = rest[start..].find('>') else {
+                break;
+            };
+            let tag = rest[start..start + end + 1].to_string();
+            rest = &rest[start + end + 1..];
+            let tag_name = tag_name_of(&tag);
+            if matches!(tag_name.as_str(), "script" | "style") {
+                let lower = rest.to_ascii_lowercase();
+                let close = format!("</{tag_name}>");
+                if let Some(at) = lower.find(&close) {
+                    rest = &rest[at + close.len()..];
+                }
+            }
+            tags.push(tag);
+        }
+        tags
+    }
+
+    fn tag_name_of(tag: &str) -> String {
+        tag[1..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase()
+    }
+
+    /// Lowercased attribute names on a tag (`style`, `onclick`, ...).
+    /// Quote-aware, so an `=` inside a URL value does not invent a name.
+    fn attr_names(tag: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rest = tag.trim_start_matches('<').trim_end_matches('>');
+        let Some(name_end) = rest.find(char::is_whitespace) else {
+            return names;
+        };
+        rest = &rest[name_end..]; // skip the tag name
+        loop {
+            rest = rest.trim_start();
+            if rest.is_empty() || rest.starts_with('/') {
+                break;
+            }
+            let len = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+                .unwrap_or(rest.len());
+            if len == 0 {
+                break;
+            }
+            let name = rest[..len].to_ascii_lowercase();
+            rest = rest[len..].trim_start();
+            if let Some(after_eq) = rest.strip_prefix('=') {
+                let value = after_eq.trim_start();
+                rest = match value.as_bytes().first() {
+                    Some(&q @ (b'"' | b'\'')) => {
+                        let close = value[1..]
+                            .find(q as char)
+                            .map(|at| at + 2)
+                            .unwrap_or(value.len());
+                        &value[close..]
+                    }
+                    _ => {
+                        let end = value.find(char::is_whitespace).unwrap_or(value.len());
+                        &value[end..]
+                    }
+                };
+            }
+            names.push(name);
+        }
+        names
+    }
+
+    /// A subresource `src=`/`href=` value is same-origin only if it is empty,
+    /// an in-page anchor (`#foo`), a root-relative path that is NOT a
+    /// protocol-relative URL (`//evil.example/x.css` would otherwise sneak
+    /// past a bare `starts_with('/')` check), or a `data:` URI.
+    fn is_same_origin_subresource(value: &str) -> bool {
+        if value.is_empty() || value.starts_with('#') || value.starts_with("data:") {
+            return true;
+        }
+        value.starts_with('/') && !value.starts_with("//")
+    }
+
+    /// `src=`/`href=` values declared on a tag (quotes stripped).
+    ///
+    /// Anchors the match on whitespace (or tag start) + attribute name + `=`,
+    /// so a `data-src=`/`data-href=`/`xlink:href=` added to the HTML later
+    /// does not get picked up as a real subresource and trip the policy
+    /// assertions with a confusing failure.
+    fn subresource_values(tag: &str) -> Vec<String> {
+        let mut values = Vec::new();
+        let bytes = tag.as_bytes();
+        for attr in ["src=", "href="] {
+            let needle = attr.as_bytes();
+            let mut i = 0;
+            while i + needle.len() <= bytes.len() {
+                if &bytes[i..i + needle.len()] == needle {
+                    // Attribute name must stand on its own: the byte before it
+                    // is either the start of the tag or ASCII whitespace. This
+                    // rejects `data-src=`, `data-href=`, `xlink:href=`, and
+                    // anything else that just happens to end in `src=`/`href=`.
+                    let anchored = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r');
+                    if anchored {
+                        let after = &tag[i + needle.len()..];
+                        let after = after.trim_start_matches(['"', '\'']);
+                        let value: String = after
+                            .chars()
+                            .take_while(|c| !matches!(c, '"' | '\'' | '>' | ' ' | '\t' | '\n'))
+                            .collect();
+                        values.push(value);
+                        i += needle.len();
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+        values
+    }
+
+    /// US-040: viewing the dashboard must cause no third-party request.
+    /// `default-src 'self'` already blocks such loads at runtime; this test
+    /// pins the sources so the CSP is never the only thing standing between a
+    /// future edit and an outbound request. Anchor navigations (`<a href>`)
+    /// are user-initiated and allowed — subresource attributes are not.
+    #[test]
+    fn assets_reference_no_third_party_subresources() {
+        for (name, html) in [
+            ("dashboard.html", DASHBOARD_HTML),
+            ("login.html", LOGIN_HTML),
+        ] {
+            for tag in tags_of(html) {
+                let tag_name = tag_name_of(&tag);
+                // `<a>`/`<area>` navigations are user-initiated, not page loads.
+                if matches!(tag_name.as_str(), "a" | "area" | "base") {
+                    continue;
+                }
+                for value in subresource_values(&tag) {
+                    assert!(
+                        is_same_origin_subresource(&value),
+                        "{name} loads a third-party subresource: <{tag_name}> {value}"
+                    );
+                }
+            }
+        }
+
+        // Scripted requests in HTML, CSS, and JS must stay on the origin too.
+        for (name, content) in ASSETS {
+            for needle in [
+                "fetch(\"http",
+                "fetch('http",
+                "@import",
+                "url(http",
+                "url(\"http",
+            ] {
+                assert!(
+                    !content.contains(needle),
+                    "{name} contains a third-party request primitive: {needle}"
+                );
+            }
+            let lower = content.to_ascii_lowercase();
+            assert!(
+                !lower.contains("fonts.googleapis.com") && !lower.contains("fonts.gstatic.com"),
+                "{name} still references Google Fonts"
+            );
+        }
+    }
+
+    /// The pages must keep working under `script-src 'self'` / `style-src
+    /// 'self'` with no inline allowance: browsers block inline `<script>`,
+    /// `<style>` blocks, `style="..."` attributes, and `on*=` handlers under
+    /// this CSP, so any of these is a silently broken dashboard.
+    #[test]
+    fn pages_are_compatible_with_the_strict_csp() {
+        for (name, html) in [
+            ("dashboard.html", DASHBOARD_HTML),
+            ("login.html", LOGIN_HTML),
+        ] {
+            assert!(
+                !html.to_ascii_lowercase().contains("<style"),
+                "{name} has an inline <style> block; move it to a local asset"
+            );
+            for tag in tags_of(html) {
+                if tag_name_of(&tag) == "script" {
+                    assert!(
+                        tag.contains("src="),
+                        "{name} has an inline <script>; move it to a local asset: {tag}"
+                    );
+                }
+                for attr in attr_names(&tag) {
+                    assert_ne!(
+                        attr, "style",
+                        "{name} uses a style attribute the strict CSP blocks: {tag}"
+                    );
+                    assert!(
+                        !attr.starts_with("on"),
+                        "{name} uses an inline event handler the strict CSP blocks: {tag}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_assets_are_served_from_this_origin() {
+        for (uri, content_type, sample) in [
+            ("/assets/dashboard.css", "text/css", ":root"),
+            ("/assets/dashboard.js", "text/javascript", "fmtHash"),
+            ("/assets/login.css", "text/css", ":root"),
+            ("/assets/login.js", "text/javascript", "fetch("),
+        ] {
+            let response = get_response(test_app(None), uri).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_asset_headers(&response);
+            let ct = response
+                .headers()
+                .get("content-type")
+                .unwrap_or_else(|| panic!("{uri} must set content-type"))
+                .to_str()
+                .unwrap();
+            assert!(ct.starts_with(content_type), "{uri}: content-type {ct}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains(sample), "{uri} served unexpected body");
+        }
+    }
+
+    /// Every local asset the pages reference must resolve on this origin —
+    /// a dead reference fails silently in the browser, and the third-party
+    /// subresource test only proves the reference is relative, not that it
+    /// answers.
+    #[tokio::test]
+    async fn every_asset_referenced_by_the_pages_is_served() {
+        for (name, html) in [
+            ("dashboard.html", DASHBOARD_HTML),
+            ("login.html", LOGIN_HTML),
+        ] {
+            for tag in tags_of(html) {
+                for value in subresource_values(&tag) {
+                    if !value.starts_with("/assets/") {
+                        continue;
+                    }
+                    let response = get_response(test_app(None), &value).await;
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::OK,
+                        "{name} references {value}, which is not served"
+                    );
+                }
+            }
+        }
+    }
+
+    /// US-077: static assets must carry a long, immutable Cache-Control so a
+    /// dashboard reload does not redownload unchanged CSS/JS. The base
+    /// security headers stay identical to dynamic routes.
+    #[tokio::test]
+    async fn static_assets_use_long_immutable_cache() {
+        for uri in [
+            "/assets/dashboard.css",
+            "/assets/dashboard.js",
+            "/assets/login.css",
+            "/assets/login.js",
+        ] {
+            let response = get_response(test_app(None), uri).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let cache_control = response
+                .headers()
+                .get("cache-control")
+                .unwrap_or_else(|| panic!("{uri} must set Cache-Control"))
+                .to_str()
+                .unwrap();
+            assert!(
+                cache_control.contains("max-age=3600"),
+                "{uri}: Cache-Control {cache_control} must contain max-age=3600"
+            );
+            assert!(
+                cache_control.contains("immutable"),
+                "{uri}: Cache-Control {cache_control} must contain immutable"
+            );
+            // Base security headers stay present on cacheable assets.
+            assert_base_security_headers(&response);
+            assert_eq!(
+                response.headers().get("content-security-policy").unwrap(),
+                CSP
+            );
+        }
+    }
+
+    /// US-077: every dynamic route must stay `no-store` so a cache in the
+    /// middle cannot stash per-session JSON or an HTML page carrying session
+    /// cookies.
+    #[tokio::test]
+    async fn dynamic_routes_use_no_store() {
+        for uri in ["/", "/health", "/api/stats"] {
+            let response = get_response(test_app(None), uri).await;
+            assert_eq!(
+                response.headers().get("cache-control").unwrap(),
+                CACHE_CONTROL_DYNAMIC,
+                "{uri} must send no-store"
+            );
+            assert_base_security_headers(&response);
+        }
+    }
+
+    /// US-077: the published Cache-Control constants are the exact strings
+    /// the policy document promises. Any accidental drift (`max-age=0` on an
+    /// asset, `must-revalidate` on no-store) fails here instead of in the
+    /// field.
+    #[test]
+    fn cache_control_constants_are_fixed() {
+        assert_eq!(CACHE_CONTROL_DYNAMIC, "no-store, max-age=0");
+        assert_eq!(CACHE_CONTROL_ASSET, "public, max-age=3600, immutable");
+    }
+
+    /// US-079: the subresource extractor must only match whitespace-anchored
+    /// `src=`/`href=`, so `data-src=`/`data-href=` added to the HTML later
+    /// cannot produce a false positive, while any real external URL still
+    /// gets caught.
+    #[test]
+    fn subresource_values_ignores_data_prefixed_attributes() {
+        // Real src/href: picked up.
+        assert_eq!(
+            subresource_values("<link href=\"/assets/x.css\">"),
+            vec!["/assets/x.css".to_string()],
+        );
+        assert_eq!(
+            subresource_values("<script src=\"/assets/y.js\" defer></script>"),
+            vec!["/assets/y.js".to_string()],
+        );
+
+        // `data-src`/`data-href` must be ignored outright.
+        assert!(
+            subresource_values("<div data-src=\"/foo.json\"></div>").is_empty(),
+            "data-src must not be picked up as a subresource"
+        );
+        assert!(
+            subresource_values("<div data-href=\"/bar\"></div>").is_empty(),
+            "data-href must not be picked up as a subresource"
+        );
+
+        // A real external URL still gets caught.
+        assert_eq!(
+            subresource_values("<script src=\"https://cdn.example.com/x.js\"></script>"),
+            vec!["https://cdn.example.com/x.js".to_string()],
+        );
+        assert_eq!(
+            subresource_values("<link href=\"//evil.example/x.css\" rel=\"stylesheet\">"),
+            vec!["//evil.example/x.css".to_string()],
+        );
+    }
+
+    /// US-079: synthetic HTML drives the policy check that
+    /// `assets_reference_no_third_party_subresources` is built on, so the
+    /// test is anchored on realistic shapes rather than only the shipping
+    /// pages.
+    #[test]
+    fn third_party_subresource_rule_covers_external_values_and_skips_data_attrs() {
+        let bad = [
+            "<script src=\"https://cdn.example.com/x.js\"></script>",
+            "<link href=\"//evil.example/x.css\" rel=\"stylesheet\">",
+        ];
+        for html in bad {
+            let mut flagged = false;
+            for tag in tags_of(html) {
+                for value in subresource_values(&tag) {
+                    if !is_same_origin_subresource(&value) {
+                        flagged = true;
+                    }
+                }
+            }
+            assert!(flagged, "external subresource must be flagged: {html}");
+        }
+
+        let good = [
+            "<div data-src=\"/foo.json\" data-href=\"/bar\"></div>",
+            "<link href=\"/assets/x.css\" rel=\"stylesheet\">",
+            "<script src=\"/assets/y.js\" defer></script>",
+        ];
+        for html in good {
+            for tag in tags_of(html) {
+                for value in subresource_values(&tag) {
+                    assert!(
+                        is_same_origin_subresource(&value),
+                        "false positive: {html} value={value}"
+                    );
+                }
+            }
+        }
+    }
 }

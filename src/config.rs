@@ -1,14 +1,253 @@
 use std::cmp::max;
+use std::net::{IpAddr, Ipv4Addr};
+use std::path::Path;
+
+/// Fixed MVP pool endpoint. `POOL_URL` can still override it, but only with
+/// the same deliberately narrow plaintext Stratum URL shape.
+const DEFAULT_POOL_URL: &str = "stratum+tcp://public-pool.io:21496";
+const MAX_WORKER_NAME_LEN: usize = 64;
+
+/// Path to the SHA-256d engine baked into the image at build time.
+pub(crate) const BUNDLED_CPUMINER_BIN: &str = "/usr/local/bin/minerd";
+
+/// Deployment profile. The release profile is the reviewed, image-only path
+/// consumers get by default; the development profile exists so contributors
+/// can swap in an arbitrary engine without that becoming an attack surface in
+/// production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinerProfile {
+    Release,
+    Development,
+}
+
+impl MinerProfile {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "release" => Ok(MinerProfile::Release),
+            "development" | "dev" => Ok(MinerProfile::Development),
+            other => Err(format!(
+                "MINER_PROFILE must be 'release' or 'development', got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Mining engine adapter. The release profile is confined to
+/// `BundledCpuminer`; `Custom` is reachable only through the development
+/// profile and never from a shipped image's defaults.
+#[derive(Debug, Clone)]
+pub enum Engine {
+    /// Reviewed SHA-256d engine compiled into the image. Argv is fixed.
+    BundledCpuminer,
+    /// Arbitrary engine. `args_template` is already tokenized argv; tokens
+    /// may contain `{POOL}`, `{USER}`, `{THREADS}` placeholders. Reserved for
+    /// the development profile.
+    Custom {
+        binary: String,
+        args_template: Vec<String>,
+    },
+}
+
+impl Engine {
+    pub fn binary(&self) -> &str {
+        match self {
+            Engine::BundledCpuminer => BUNDLED_CPUMINER_BIN,
+            Engine::Custom { binary, .. } => binary,
+        }
+    }
+
+    pub fn argv(&self, threads: usize, pool_url: &str, pool_username: &str) -> Vec<String> {
+        match self {
+            Engine::BundledCpuminer => vec![
+                "-a".into(),
+                "sha256d".into(),
+                "-o".into(),
+                pool_url.into(),
+                "-u".into(),
+                pool_username.into(),
+                "-p".into(),
+                "x".into(),
+                "-t".into(),
+                threads.to_string(),
+            ],
+            Engine::Custom { args_template, .. } => args_template
+                .iter()
+                .map(|token| {
+                    token
+                        .replace("{POOL}", pool_url)
+                        .replace("{USER}", pool_username)
+                        .replace("{THREADS}", &threads.to_string())
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Mining topology. Only `Solo` is implemented in this MVP; `Shared` is
+/// modeled now so a future pool-account flow has a typed home, but selecting
+/// it today is an explicit, documented error rather than a silent fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiningMode {
+    Solo,
+    Shared,
+}
+
+impl MiningMode {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "solo" => Ok(MiningMode::Solo),
+            "shared" => Ok(MiningMode::Shared),
+            other => Err(format!("MODE must be 'solo' or 'shared', got {other:?}")),
+        }
+    }
+}
+
+/// Bitcoin network the payout address belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitcoinNetwork {
+    Mainnet,
+    Testnet,
+}
+
+impl BitcoinNetwork {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "mainnet" => Ok(BitcoinNetwork::Mainnet),
+            "testnet" => Ok(BitcoinNetwork::Testnet),
+            other => Err(format!(
+                "NETWORK must be 'mainnet' or 'testnet', got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Transport policy for the Stratum connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsPolicy {
+    /// The bundled cpuminer engine speaks plaintext Stratum only (see
+    /// SECURITY.md). This is the only policy this MVP can actually honor.
+    PlaintextAllowed,
+    Required,
+}
+
+impl TlsPolicy {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "plaintext" => Ok(TlsPolicy::PlaintextAllowed),
+            "required" => Ok(TlsPolicy::Required),
+            other => Err(format!(
+                "TLS_POLICY must be 'plaintext' or 'required', got {other:?}"
+            )),
+        }
+    }
+}
+
+fn validate_worker_name(raw: &str) -> Result<String, String> {
+    if raw.is_empty() || raw.len() > MAX_WORKER_NAME_LEN {
+        return Err(format!(
+            "WORKER_NAME must be 1 to {MAX_WORKER_NAME_LEN} ASCII characters"
+        ));
+    }
+    if !raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Err("WORKER_NAME may contain only ASCII letters, digits, '_' and '-'".into());
+    }
+    Ok(raw.to_string())
+}
+
+fn validate_pool_url(raw: &str) -> Result<String, String> {
+    if raw.is_empty() || !raw.is_ascii() || raw.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err("POOL_URL must be an ASCII URL without whitespace".into());
+    }
+
+    let url = reqwest::Url::parse(raw).map_err(|e| format!("POOL_URL is invalid: {e}"))?;
+    if url.scheme() != "stratum+tcp" {
+        return Err("POOL_URL must use the stratum+tcp scheme".into());
+    }
+    if raw.contains('@') || !url.username().is_empty() || url.password().is_some() {
+        return Err("POOL_URL must not contain credentials".into());
+    }
+    if !url.path().is_empty() || url.query().is_some() || url.fragment().is_some() {
+        return Err("POOL_URL must not contain a path, query, or fragment".into());
+    }
+
+    let host = url
+        .host_str()
+        .ok_or("POOL_URL must contain a DNS hostname")?;
+    if host.parse::<IpAddr>().is_ok() || host.contains(':') {
+        return Err("POOL_URL must use a DNS hostname, not an IP literal".into());
+    }
+    if host.len() > 253
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                || !label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+    {
+        return Err("POOL_URL contains an invalid DNS hostname".into());
+    }
+
+    let port = url
+        .port()
+        .ok_or("POOL_URL must include an explicit numeric port")?;
+    if port == 0 {
+        return Err("POOL_URL port must be between 1 and 65535".into());
+    }
+
+    Ok(raw.to_string())
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub wallet: String,
-    pub pool_url: String,
+    // Validated at load time; consumed once MODE=shared ships (currently rejected above).
+    #[allow(dead_code)]
+    pub mode: MiningMode,
+    // Validated at load time; consumed by payout address validation (US-008).
+    #[allow(dead_code)]
+    pub network: BitcoinNetwork,
+    pub payout_address: String,
+    pub pool_username: String,
+    // Folded into `pool_username` at load time; kept for display/logging use.
+    #[allow(dead_code)]
     pub worker_name: String,
+    // Reserved for shared-pool authentication once MODE=shared ships.
+    #[allow(dead_code)]
+    pub secret_file: Option<String>,
+    pub pool_url: String,
+    // Validated at load time; consumed once TLS_POLICY=required ships.
+    #[allow(dead_code)]
+    pub tls_policy: TlsPolicy,
     pub power: u8,
+    /// Whole-core cap mirroring the container's `cpus:` ceiling. `None`
+    /// means "no cap known"; set, it clamps `threads()` so the engine
+    /// never launches more workers than Docker allows CPU time for.
+    pub cpu_limit: Option<u32>,
     pub port: u16,
-    pub miner_bin: String,
-    pub miner_args: Option<String>,
+    /// Address the dashboard HTTP server binds to. Default is `127.0.0.1`
+    /// outside a container (loopback-only — remote/LAN access is explicitly
+    /// out of scope in the MVP, see SECURITY.md). Inside a container (signaled
+    /// by `IN_CONTAINER=1` from Compose or `/.dockerenv`), the default is
+    /// `0.0.0.0` because the container is only reachable through Compose's
+    /// `127.0.0.1:3500:3500` publication. `BIND_ADDRESS` can override this,
+    /// but non-loopback overrides are refused outside a container.
+    pub bind_address: IpAddr,
+    // Validated at load time; carried on Config so operators can see which
+    // profile the running process picked up.
+    #[allow(dead_code)]
+    pub profile: MinerProfile,
+    pub engine: Engine,
     // Read in phase 2 (dashboard login screen)
     #[allow(dead_code)]
     pub dashboard_password: Option<String>,
@@ -16,17 +255,89 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
-        Self::from_vars(|k| std::env::var(k).ok())
+        // `/.dockerenv` is Docker's own in-container marker; use it as a
+        // fallback so a running container that forgot to set IN_CONTAINER
+        // still gets the container-side bind defaults.
+        let dockerenv_exists = Path::new("/.dockerenv").exists();
+        Self::from_vars(|k| {
+            if k == "IN_CONTAINER" {
+                match std::env::var(k).ok() {
+                    Some(v) => Some(v),
+                    None if dockerenv_exists => Some("1".into()),
+                    None => None,
+                }
+            } else {
+                std::env::var(k).ok()
+            }
+        })
     }
 
-    fn from_vars<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
-        let wallet = get("WALLET")
+    pub(crate) fn from_vars<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
+        let mode = match get("MODE") {
+            None => MiningMode::Solo,
+            Some(raw) => MiningMode::parse(&raw)?,
+        };
+        if mode == MiningMode::Shared {
+            return Err(
+                "MODE=shared is not implemented in this MVP; only solo mining against the \
+                 fixed pool endpoint is supported. Set MODE=solo or omit it."
+                    .into(),
+            );
+        }
+
+        let network = match get("NETWORK") {
+            None => BitcoinNetwork::Mainnet,
+            Some(raw) => BitcoinNetwork::parse(&raw)?,
+        };
+
+        let tls_policy = match get("TLS_POLICY") {
+            None => TlsPolicy::PlaintextAllowed,
+            Some(raw) => TlsPolicy::parse(&raw)?,
+        };
+        if tls_policy == TlsPolicy::Required {
+            return Err(
+                "TLS_POLICY=required is not supported: the bundled cpuminer engine has no TLS \
+                 support in this MVP (see SECURITY.md). Use TLS_POLICY=plaintext or omit it."
+                    .into(),
+            );
+        }
+
+        let payout_address = get("WALLET")
             .map(|w| w.trim().to_string())
             .filter(|w| !w.is_empty())
-            .ok_or("WALLET is required (your BTC address)")?;
-        if wallet.len() < 26 {
-            return Err(format!("WALLET looks invalid (too short): {wallet:?}"));
-        }
+            .ok_or("WALLET is required (your BTC payout address)")?;
+        crate::bitcoin_address::validate(&payout_address, network)
+            .map_err(|e| format!("WALLET is not a valid payout address: {e}"))?;
+
+        let worker_name =
+            validate_worker_name(&get("WORKER_NAME").unwrap_or_else(|| "miner".into()))?;
+
+        let pool_url =
+            validate_pool_url(&get("POOL_URL").unwrap_or_else(|| DEFAULT_POOL_URL.into()))?;
+
+        let pool_username = match get("POOL_USERNAME") {
+            Some(raw) => {
+                let trimmed = raw.trim().to_string();
+                if trimmed.is_empty() {
+                    return Err("POOL_USERNAME, when set, cannot be empty".into());
+                }
+                trimmed
+            }
+            None => format!("{payout_address}.{worker_name}"),
+        };
+
+        let secret_file = match get("SECRET_FILE") {
+            Some(raw) => {
+                let path = raw.trim().to_string();
+                if !Path::new(&path).is_file() {
+                    return Err(format!(
+                        "SECRET_FILE does not point to a readable file: {path:?}"
+                    ));
+                }
+                Some(path)
+            }
+            None => None,
+        };
 
         let power = match get("POWER") {
             None => 50,
@@ -40,6 +351,26 @@ impl Config {
                 ))?,
         };
 
+        let cpu_limit = match get("CPU_LIMIT") {
+            None => None,
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    let parsed: f32 = trimmed
+                        .parse()
+                        .map_err(|_| format!("CPU_LIMIT must be a positive number, got {raw:?}"))?;
+                    if parsed <= 0.0 || !parsed.is_finite() {
+                        return Err(format!("CPU_LIMIT must be a positive number, got {raw:?}"));
+                    }
+                    // Floor to whole cores for thread accounting; Docker still
+                    // enforces the fractional cap at runtime.
+                    Some(parsed.floor().max(1.0) as u32)
+                }
+            }
+        };
+
         let port = match get("PORT") {
             None => 3500,
             Some(raw) => raw
@@ -48,61 +379,112 @@ impl Config {
                 .map_err(|_| format!("PORT must be a number, got {raw:?}"))?,
         };
 
+        let in_container = matches!(
+            get("IN_CONTAINER").as_deref().map(str::trim),
+            Some("1" | "true" | "True" | "TRUE" | "yes")
+        );
+        let bind_address = match get("BIND_ADDRESS") {
+            None => {
+                if in_container {
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                } else {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                }
+            }
+            Some(raw) => {
+                let trimmed = raw.trim();
+                let ip: IpAddr = trimmed
+                    .parse()
+                    .map_err(|_| format!("BIND_ADDRESS must be a valid IP literal, got {raw:?}"))?;
+                if !in_container && !ip.is_loopback() {
+                    return Err(format!(
+                        "BIND_ADDRESS={trimmed} is refused outside a container: the dashboard \
+                         must bind to a loopback address (127.0.0.1 or ::1). Remote/LAN access \
+                         is explicitly out of scope in this MVP (SECURITY.md, US-036)."
+                    ));
+                }
+                ip
+            }
+        };
+
+        let profile = match get("MINER_PROFILE") {
+            None => MinerProfile::Release,
+            Some(raw) => MinerProfile::parse(&raw)?,
+        };
+        let miner_bin_override = get("MINER_BIN").filter(|v| !v.trim().is_empty());
+        let miner_args_override = get("MINER_ARGS").filter(|v| !v.trim().is_empty());
+
+        let engine = match profile {
+            MinerProfile::Release => {
+                if miner_bin_override.is_some() {
+                    return Err(
+                        "MINER_BIN is rejected in the release profile: only the reviewed, \
+                         image-baked cpuminer is allowed. Host-mounted engines are a \
+                         development-only feature — set MINER_PROFILE=development to opt in."
+                            .into(),
+                    );
+                }
+                if miner_args_override.is_some() {
+                    return Err(
+                        "MINER_ARGS is rejected in the release profile: the bundled engine's \
+                         argv is fixed. Set MINER_PROFILE=development to supply custom argv."
+                            .into(),
+                    );
+                }
+                Engine::BundledCpuminer
+            }
+            MinerProfile::Development => match (miner_bin_override, miner_args_override) {
+                (None, None) => Engine::BundledCpuminer,
+                (bin, args) => {
+                    let binary = bin.unwrap_or_else(|| BUNDLED_CPUMINER_BIN.to_string());
+                    let args_template: Vec<String> = args
+                        .map(|raw| raw.split_whitespace().map(String::from).collect())
+                        .unwrap_or_default();
+                    Engine::Custom {
+                        binary,
+                        args_template,
+                    }
+                }
+            },
+        };
+
         Ok(Config {
-            wallet,
-            pool_url: get("POOL_URL")
-                .unwrap_or_else(|| "stratum+tcp://public-pool.io:21496".into()),
-            worker_name: get("WORKER_NAME").unwrap_or_else(|| "miner".into()),
+            mode,
+            network,
+            payout_address,
+            pool_username,
+            worker_name,
+            secret_file,
+            pool_url,
+            tls_policy,
             power,
+            cpu_limit,
             port,
-            miner_bin: get("MINER_BIN").unwrap_or_else(|| "/usr/local/bin/minerd".into()),
-            miner_args: get("MINER_ARGS").filter(|a| !a.trim().is_empty()),
+            bind_address,
+            profile,
+            engine,
             dashboard_password: get("DASHBOARD_PASSWORD").filter(|p| !p.is_empty()),
         })
     }
 
-    /// Miner threads for a given core count, honoring POWER%. Never less than 1.
+    /// Miner threads for a given core count, honoring POWER%. Capped by
+    /// `CPU_LIMIT` when set, so the engine never launches more workers than
+    /// the container's `cpus:` ceiling can actually schedule. Never less
+    /// than 1.
     pub fn threads(&self, cores: usize) -> usize {
-        max(1, cores * self.power as usize / 100)
-    }
-
-    /// Stratum username: `wallet.worker`, unless the wallet already embeds a worker name.
-    pub fn stratum_user(&self) -> String {
-        if self.wallet.contains('.') {
-            self.wallet.clone()
-        } else {
-            format!("{}.{}", self.wallet, self.worker_name)
+        let base = max(1, cores * self.power as usize / 100);
+        match self.cpu_limit {
+            Some(limit) => max(1, base.min(limit as usize)),
+            None => base,
         }
     }
 
-    /// Arguments for the miner process. With MINER_ARGS set, the engine is
-    /// fully pluggable (GPU miners, other algos): each token has {POOL},
-    /// {USER} and {THREADS} substituted. Otherwise, defaults to cpuminer
-    /// sha256d flags.
+    /// Argv the supervisor will pass straight to the engine binary. Never
+    /// routed through a shell: the supervisor calls `Command::new(binary)`
+    /// with these tokens via `.args(...)` so no shell expansion is possible.
     pub fn miner_command_args(&self, threads: usize) -> Vec<String> {
-        match &self.miner_args {
-            Some(raw) => raw
-                .split_whitespace()
-                .map(|token| {
-                    token
-                        .replace("{POOL}", &self.pool_url)
-                        .replace("{USER}", &self.stratum_user())
-                        .replace("{THREADS}", &threads.to_string())
-                })
-                .collect(),
-            None => vec![
-                "-a".into(),
-                "sha256d".into(),
-                "-o".into(),
-                self.pool_url.clone(),
-                "-u".into(),
-                self.stratum_user(),
-                "-p".into(),
-                "x".into(),
-                "-t".into(),
-                threads.to_string(),
-            ],
-        }
+        self.engine
+            .argv(threads, &self.pool_url, &self.pool_username)
     }
 }
 
@@ -119,7 +501,8 @@ mod tests {
         Config::from_vars(|k| map.get(k).cloned())
     }
 
-    const WALLET: (&str, &str) = ("WALLET", "bc1qexamplewalletaddress0000000000");
+    const WALLET: (&str, &str) = ("WALLET", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+    const TESTNET_WALLET: (&str, &str) = ("WALLET", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx");
 
     #[test]
     fn wallet_is_required() {
@@ -129,13 +512,26 @@ mod tests {
 
     #[test]
     fn wallet_is_trimmed() {
-        let c = cfg(&[("WALLET", "  bc1qexamplewalletaddress0000000000  ")]).unwrap();
-        assert_eq!(c.wallet, "bc1qexamplewalletaddress0000000000");
+        let c = cfg(&[("WALLET", "  bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4  ")]).unwrap();
+        assert_eq!(
+            c.payout_address,
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        );
     }
 
     #[test]
     fn short_wallet_is_rejected() {
         assert!(cfg(&[("WALLET", "bc1qshort")]).is_err());
+    }
+
+    #[test]
+    fn invalid_wallet_checksum_is_rejected() {
+        assert!(cfg(&[("WALLET", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5")]).is_err());
+    }
+
+    #[test]
+    fn mainnet_wallet_rejected_when_network_is_testnet() {
+        assert!(cfg(&[WALLET, ("NETWORK", "testnet")]).is_err());
     }
 
     #[test]
@@ -173,15 +569,161 @@ mod tests {
     }
 
     #[test]
-    fn stratum_user_appends_worker_name() {
+    fn pool_username_appends_worker_name() {
         let c = cfg(&[WALLET, ("WORKER_NAME", "vps1")]).unwrap();
-        assert_eq!(c.stratum_user(), "bc1qexamplewalletaddress0000000000.vps1");
+        assert_eq!(
+            c.pool_username,
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.vps1"
+        );
     }
 
     #[test]
-    fn stratum_user_keeps_wallet_with_embedded_worker() {
-        let c = cfg(&[("WALLET", "bc1qexamplewalletaddress0000000000.rig")]).unwrap();
-        assert_eq!(c.stratum_user(), "bc1qexamplewalletaddress0000000000.rig");
+    fn worker_name_accepts_only_bounded_safe_characters() {
+        for valid in [
+            "a",
+            "worker-01",
+            "RIG_two",
+            &"a".repeat(MAX_WORKER_NAME_LEN),
+        ] {
+            let c = cfg(&[WALLET, ("WORKER_NAME", valid)]).unwrap();
+            assert_eq!(c.worker_name, valid);
+        }
+
+        for invalid in [
+            "",
+            "two words",
+            "../other-worker",
+            "worker.name",
+            "worker?admin=true",
+            "worker#fragment",
+            "worker\n--threads=99",
+            "--extra CLI flags",
+            &"a".repeat(MAX_WORKER_NAME_LEN + 1),
+        ] {
+            assert!(
+                cfg(&[WALLET, ("WORKER_NAME", invalid)]).is_err(),
+                "WORKER_NAME={invalid:?} should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_url_accepts_only_stratum_dns_host_and_explicit_port() {
+        for valid in [
+            "stratum+tcp://public-pool.io:21496",
+            "stratum+tcp://pool-1.example.com:3333",
+            "stratum+tcp://POOL.EXAMPLE:1",
+        ] {
+            let c = cfg(&[WALLET, ("POOL_URL", valid)]).unwrap();
+            assert_eq!(c.pool_url, valid);
+        }
+
+        for invalid in [
+            "public-pool.io:21496",
+            "http://public-pool.io:21496",
+            "stratum+tcp://public-pool.io",
+            "stratum+tcp://public-pool.io:not-a-port",
+            "stratum+tcp://public-pool.io:0",
+            "stratum+tcp://user:pass@public-pool.io:21496",
+            "stratum+tcp://@public-pool.io:21496",
+            "stratum+tcp://127.0.0.1:21496",
+            "stratum+tcp://[::1]:21496",
+            "stratum+tcp://public-pool.io:21496/",
+            "stratum+tcp://public-pool.io:21496/other",
+            "stratum+tcp://public-pool.io:21496/?admin=true",
+            "stratum+tcp://public-pool.io:21496/#fragment",
+            "stratum+tcp://public-pool.io:21496\n--threads=99",
+            "--extra CLI flags",
+            "stratum+tcp://-bad.example:3333",
+            "stratum+tcp://bad-.example:3333",
+        ] {
+            assert!(
+                cfg(&[WALLET, ("POOL_URL", invalid)]).is_err(),
+                "POOL_URL={invalid:?} should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_username_override_is_used_verbatim() {
+        let c = cfg(&[WALLET, ("POOL_USERNAME", "custom.user")]).unwrap();
+        assert_eq!(c.pool_username, "custom.user");
+    }
+
+    #[test]
+    fn empty_pool_username_override_is_rejected() {
+        assert!(cfg(&[WALLET, ("POOL_USERNAME", "   ")]).is_err());
+    }
+
+    #[test]
+    fn mode_defaults_to_solo() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert_eq!(c.mode, MiningMode::Solo);
+    }
+
+    #[test]
+    fn mode_shared_is_explicitly_rejected() {
+        let err = cfg(&[WALLET, ("MODE", "shared")]).unwrap_err();
+        assert!(err.contains("not implemented"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn mode_rejects_unknown_value() {
+        assert!(cfg(&[WALLET, ("MODE", "pooled")]).is_err());
+    }
+
+    #[test]
+    fn network_defaults_to_mainnet() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert_eq!(c.network, BitcoinNetwork::Mainnet);
+    }
+
+    #[test]
+    fn network_accepts_testnet() {
+        let c = cfg(&[TESTNET_WALLET, ("NETWORK", "testnet")]).unwrap();
+        assert_eq!(c.network, BitcoinNetwork::Testnet);
+    }
+
+    #[test]
+    fn network_rejects_unknown_value() {
+        assert!(cfg(&[WALLET, ("NETWORK", "regtest")]).is_err());
+    }
+
+    #[test]
+    fn tls_policy_defaults_to_plaintext_allowed() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert_eq!(c.tls_policy, TlsPolicy::PlaintextAllowed);
+    }
+
+    #[test]
+    fn tls_policy_required_is_explicitly_rejected() {
+        let err = cfg(&[WALLET, ("TLS_POLICY", "required")]).unwrap_err();
+        assert!(err.contains("not supported"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tls_policy_rejects_unknown_value() {
+        assert!(cfg(&[WALLET, ("TLS_POLICY", "opportunistic")]).is_err());
+    }
+
+    #[test]
+    fn secret_file_missing_path_is_rejected() {
+        assert!(cfg(&[WALLET, ("SECRET_FILE", "/nonexistent/secret")]).is_err());
+    }
+
+    #[test]
+    fn secret_file_existing_path_is_accepted() {
+        let path = std::env::temp_dir().join("miner-config-test-secret-file");
+        std::fs::write(&path, "sekrit\n").unwrap();
+        let c = cfg(&[WALLET, ("SECRET_FILE", path.to_str().unwrap())]).unwrap();
+        assert_eq!(c.secret_file.as_deref(), path.to_str());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn secret_file_defaults_to_none() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert!(c.secret_file.is_none());
     }
 
     #[test]
@@ -195,7 +737,7 @@ mod tests {
                 "-o",
                 "stratum+tcp://public-pool.io:21496",
                 "-u",
-                "bc1qexamplewalletaddress0000000000.miner",
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.miner",
                 "-p",
                 "x",
                 "-t",
@@ -205,22 +747,60 @@ mod tests {
     }
 
     #[test]
-    fn custom_miner_args_substitute_placeholders() {
+    fn default_profile_is_release() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert_eq!(c.profile, MinerProfile::Release);
+        assert!(matches!(c.engine, Engine::BundledCpuminer));
+        assert_eq!(c.engine.binary(), BUNDLED_CPUMINER_BIN);
+    }
+
+    #[test]
+    fn release_profile_rejects_miner_bin() {
+        let err = cfg(&[WALLET, ("MINER_BIN", "/host/mounted/evil")]).unwrap_err();
+        assert!(err.contains("MINER_BIN"), "unexpected error: {err}");
+        assert!(err.contains("development"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn release_profile_rejects_miner_args() {
+        let err = cfg(&[WALLET, ("MINER_ARGS", "--benchmark")]).unwrap_err();
+        assert!(err.contains("MINER_ARGS"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn blank_miner_bin_or_args_do_not_trip_release_guard() {
+        // Operators may leave the vars declared but empty; that's equivalent
+        // to unset and must not reject the release profile.
+        let c = cfg(&[WALLET, ("MINER_BIN", "   "), ("MINER_ARGS", "   ")]).unwrap();
+        assert!(matches!(c.engine, Engine::BundledCpuminer));
+    }
+
+    #[test]
+    fn miner_profile_rejects_unknown_value() {
+        assert!(cfg(&[WALLET, ("MINER_PROFILE", "staging")]).is_err());
+    }
+
+    #[test]
+    fn development_profile_accepts_custom_engine() {
         let c = cfg(&[
             WALLET,
+            ("MINER_PROFILE", "development"),
+            ("MINER_BIN", "/opt/gpu-miner"),
             (
                 "MINER_ARGS",
                 "--url {POOL} --user {USER} --threads {THREADS} --gpu 0",
             ),
         ])
         .unwrap();
+        assert_eq!(c.profile, MinerProfile::Development);
+        assert_eq!(c.engine.binary(), "/opt/gpu-miner");
         assert_eq!(
             c.miner_command_args(4),
             vec![
                 "--url",
                 "stratum+tcp://public-pool.io:21496",
                 "--user",
-                "bc1qexamplewalletaddress0000000000.miner",
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.miner",
                 "--threads",
                 "4",
                 "--gpu",
@@ -230,15 +810,84 @@ mod tests {
     }
 
     #[test]
-    fn custom_miner_args_without_placeholders_pass_verbatim() {
-        let c = cfg(&[WALLET, ("MINER_ARGS", "--benchmark")]).unwrap();
+    fn development_profile_without_overrides_still_uses_bundled() {
+        let c = cfg(&[WALLET, ("MINER_PROFILE", "dev")]).unwrap();
+        assert!(matches!(c.engine, Engine::BundledCpuminer));
+    }
+
+    #[test]
+    fn development_profile_custom_args_pass_verbatim() {
+        let c = cfg(&[
+            WALLET,
+            ("MINER_PROFILE", "development"),
+            ("MINER_ARGS", "--benchmark"),
+        ])
+        .unwrap();
         assert_eq!(c.miner_command_args(8), vec!["--benchmark"]);
     }
 
     #[test]
-    fn blank_miner_args_fall_back_to_default() {
-        let c = cfg(&[WALLET, ("MINER_ARGS", "   ")]).unwrap();
-        assert_eq!(c.miner_command_args(1)[..2], ["-a", "sha256d"]);
+    fn argv_is_a_tokenized_vec_not_a_shell_string() {
+        // The acceptance criterion is that engine arguments are built as an
+        // argv array; this test pins that an attempted shell metacharacter
+        // ends up as a single argv token, not multiple shell-expanded ones.
+        let c = cfg(&[
+            WALLET,
+            ("MINER_PROFILE", "development"),
+            ("MINER_ARGS", "--note=hello;rm$(whoami)"),
+        ])
+        .unwrap();
+        let argv = c.miner_command_args(1);
+        assert_eq!(argv, vec!["--note=hello;rm$(whoami)"]);
+    }
+
+    #[test]
+    fn cpu_limit_defaults_to_none() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert!(c.cpu_limit.is_none());
+    }
+
+    #[test]
+    fn cpu_limit_is_parsed_and_floored_to_whole_cores() {
+        let c = cfg(&[WALLET, ("CPU_LIMIT", "2")]).unwrap();
+        assert_eq!(c.cpu_limit, Some(2));
+
+        let c = cfg(&[WALLET, ("CPU_LIMIT", "2.5")]).unwrap();
+        assert_eq!(c.cpu_limit, Some(2));
+
+        let c = cfg(&[WALLET, ("CPU_LIMIT", "0.5")]).unwrap();
+        // Fractional cap floors to 0 cores, but we never go below 1.
+        assert_eq!(c.cpu_limit, Some(1));
+    }
+
+    #[test]
+    fn cpu_limit_blank_is_treated_as_unset() {
+        let c = cfg(&[WALLET, ("CPU_LIMIT", "   ")]).unwrap();
+        assert!(c.cpu_limit.is_none());
+    }
+
+    #[test]
+    fn cpu_limit_rejects_nonpositive_and_nonnumeric() {
+        for bad in ["0", "-1", "abc"] {
+            assert!(
+                cfg(&[WALLET, ("CPU_LIMIT", bad)]).is_err(),
+                "CPU_LIMIT={bad:?} should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn threads_are_capped_by_cpu_limit() {
+        // POWER=100 on an 8-core host would normally request 8 threads, but a
+        // CPU_LIMIT of 2 pins the ceiling at 2 — matching the container cap.
+        let c = cfg(&[WALLET, ("POWER", "100"), ("CPU_LIMIT", "2")]).unwrap();
+        assert_eq!(c.threads(8), 2);
+        // Lower demand still honored.
+        let c = cfg(&[WALLET, ("POWER", "25"), ("CPU_LIMIT", "4")]).unwrap();
+        assert_eq!(c.threads(8), 2);
+        // No cap set — behavior unchanged from US-002.
+        let c = cfg(&[WALLET, ("POWER", "100")]).unwrap();
+        assert_eq!(c.threads(8), 8);
     }
 
     #[test]
@@ -247,5 +896,74 @@ mod tests {
         assert_eq!(c.pool_url, "stratum+tcp://public-pool.io:21496");
         assert_eq!(c.port, 3500);
         assert!(c.dashboard_password.is_none());
+    }
+
+    #[test]
+    fn bind_defaults_to_loopback_outside_container() {
+        let c = cfg(&[WALLET]).unwrap();
+        assert_eq!(
+            c.bind_address,
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            "outside a container the dashboard must default to 127.0.0.1"
+        );
+        assert!(c.bind_address.is_loopback());
+    }
+
+    #[test]
+    fn bind_defaults_to_wildcard_inside_container() {
+        let c = cfg(&[WALLET, ("IN_CONTAINER", "1")]).unwrap();
+        assert_eq!(
+            c.bind_address,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            "inside a container the dashboard binds 0.0.0.0 so Compose's \
+             127.0.0.1:3500 publication can forward traffic"
+        );
+    }
+
+    #[test]
+    fn bind_accepts_loopback_override_outside_container() {
+        let c = cfg(&[WALLET, ("BIND_ADDRESS", "127.0.0.1")]).unwrap();
+        assert!(c.bind_address.is_loopback());
+        let c = cfg(&[WALLET, ("BIND_ADDRESS", "::1")]).unwrap();
+        assert!(c.bind_address.is_loopback());
+    }
+
+    #[test]
+    fn bind_refuses_ipv4_wildcard_outside_container() {
+        let err = cfg(&[WALLET, ("BIND_ADDRESS", "0.0.0.0")]).unwrap_err();
+        assert!(err.contains("refused outside a container"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_refuses_ipv6_wildcard_outside_container() {
+        let err = cfg(&[WALLET, ("BIND_ADDRESS", "::")]).unwrap_err();
+        assert!(err.contains("refused outside a container"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_refuses_non_loopback_ipv4_outside_container() {
+        let err = cfg(&[WALLET, ("BIND_ADDRESS", "192.168.1.10")]).unwrap_err();
+        assert!(err.contains("refused outside a container"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_refuses_non_loopback_ipv6_outside_container() {
+        let err = cfg(&[WALLET, ("BIND_ADDRESS", "fe80::1")]).unwrap_err();
+        assert!(err.contains("refused outside a container"), "got: {err}");
+    }
+
+    #[test]
+    fn bind_rejects_non_ip_values() {
+        assert!(cfg(&[WALLET, ("BIND_ADDRESS", "localhost")]).is_err());
+        assert!(cfg(&[WALLET, ("BIND_ADDRESS", "not-an-ip")]).is_err());
+        assert!(cfg(&[WALLET, ("BIND_ADDRESS", "127.0.0.1:3500")]).is_err());
+    }
+
+    #[test]
+    fn bind_allows_wildcard_inside_container_override() {
+        // Operators running the container directly can still override, as
+        // long as IN_CONTAINER is signalled.
+        let c = cfg(&[WALLET, ("IN_CONTAINER", "1"), ("BIND_ADDRESS", "0.0.0.0")]).unwrap();
+        assert_eq!(c.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
 }

@@ -40,8 +40,10 @@ pub fn spawn_supervisor(
                 .unwrap_or(1);
             let threads = cfg.threads(cores);
 
-            // minerd logs shares to stderr; inheriting sends them to `docker logs`
-            let spawned = Command::new(&cfg.miner_bin)
+            // minerd logs shares to stderr; inheriting sends them to `docker logs`.
+            // Arguments are passed as an argv array via `.args(...)` — never a
+            // shell string — so no token can be shell-expanded.
+            let spawned = Command::new(cfg.engine.binary())
                 .args(cfg.miner_command_args(threads))
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
@@ -93,12 +95,13 @@ pub fn spawn_supervisor(
                     }
                 }
                 Err(e) => {
+                    let bin = cfg.engine.binary();
                     {
                         let mut s = status.write().await;
                         s.running = false;
-                        s.last_error = Some(format!("failed to start {}: {e}", cfg.miner_bin));
+                        s.last_error = Some(format!("failed to start {bin}: {e}"));
                     }
-                    tracing::error!(bin = %cfg.miner_bin, error = %e, "failed to start miner, retrying in {backoff:?}");
+                    tracing::error!(bin = %bin, error = %e, "failed to start miner, retrying in {backoff:?}");
                 }
             }
 

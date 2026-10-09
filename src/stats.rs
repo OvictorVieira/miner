@@ -11,6 +11,14 @@ const NEXT_HALVING_BLOCK: u64 = 1_050_000;
 pub const POOL_API: &str = "https://public-pool.io:40557/api";
 pub const MEMPOOL_API: &str = "https://mempool.space/api";
 
+fn pool_client_url(wallet: &str) -> String {
+    let mut url = reqwest::Url::parse(POOL_API).expect("POOL_API must be a valid fixed URL");
+    url.path_segments_mut()
+        .expect("POOL_API must be a hierarchical URL")
+        .extend(["client", wallet]);
+    url.into()
+}
+
 /// Real miner stats from the Public Pool client API. All zeros until the
 /// pool has seen shares from this wallet.
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -95,7 +103,7 @@ impl StatsCache {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
-            .user_agent(concat!("fullsystem-miner/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("community-miner/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("failed to build http client");
         Self {
@@ -141,9 +149,7 @@ impl StatsCache {
     }
 
     async fn fetch_pool(&self, wallet: &str) -> Option<PoolStats> {
-        let v = self
-            .fetch_json(format!("{POOL_API}/client/{wallet}"))
-            .await?;
+        let v = self.fetch_json(pool_client_url(wallet)).await?;
         Some(parse_pool_stats(&v))
     }
 
@@ -202,6 +208,18 @@ mod tests {
     #[test]
     fn pool_stats_default_to_zero_on_missing_fields() {
         assert_eq!(parse_pool_stats(&json!({})), PoolStats::default());
+    }
+
+    #[test]
+    fn pool_client_url_percent_encodes_the_wallet_path_segment() {
+        assert_eq!(
+            pool_client_url("wallet/../other?admin=true#fragment with space"),
+            "https://public-pool.io:40557/api/client/wallet%2F..%2Fother%3Fadmin=true%23fragment%20with%20space"
+        );
+        assert_eq!(
+            pool_client_url("bc1qvalidatedwallet"),
+            "https://public-pool.io:40557/api/client/bc1qvalidatedwallet"
+        );
     }
 
     #[test]
