@@ -1,9 +1,15 @@
 use rand::RngExt;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+
+const SESSION_MAX_AGE_SECONDS: u32 = 12 * 60 * 60;
 
 /// One shared session token per container run, created only when
 /// DASHBOARD_PASSWORD is set. Restarting the container logs everyone out.
 pub struct Auth {
-    password: Option<String>,
+    // Keep only a fixed-size digest. Constant-time comparison of equal-size
+    // values avoids revealing the first differing byte or password length.
+    password_digest: Option<[u8; 32]>,
     session_token: String,
 }
 
@@ -12,20 +18,26 @@ impl Auth {
         let bytes: [u8; 32] = rand::rng().random();
         let session_token = bytes.iter().map(|b| format!("{b:02x}")).collect();
         Self {
-            password,
+            password_digest: password.map(|password| Sha256::digest(password).into()),
             session_token,
         }
     }
 
     pub fn required(&self) -> bool {
-        self.password.is_some()
+        self.password_digest.is_some()
     }
 
     /// Validates a login attempt; returns the session token to set as cookie.
     pub fn login(&self, attempt: &str) -> Option<&str> {
-        match &self.password {
-            Some(p) if p == attempt => Some(&self.session_token),
-            _ => None,
+        let attempt_digest: [u8; 32] = Sha256::digest(attempt).into();
+        if self
+            .password_digest
+            .as_ref()
+            .is_some_and(|expected| bool::from(expected.ct_eq(&attempt_digest)))
+        {
+            Some(&self.session_token)
+        } else {
+            None
         }
     }
 
@@ -44,8 +56,8 @@ impl Auth {
 
     pub fn cookie(&self) -> String {
         format!(
-            "session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000",
-            self.session_token
+            "session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE_SECONDS}",
+            self.session_token,
         )
     }
 }
@@ -88,5 +100,12 @@ mod tests {
         let a = Auth::new(Some("x".into()));
         let b = Auth::new(Some("x".into()));
         assert_ne!(a.login("x").unwrap(), b.login("x").unwrap());
+    }
+
+    #[test]
+    fn session_cookie_expires_within_twelve_hours() {
+        let auth = Auth::new(Some("hunter2".into()));
+        assert!(auth.cookie().contains("Max-Age=43200"));
+        assert!(!auth.cookie().contains("2592000"));
     }
 }

@@ -12,11 +12,12 @@ mod payout_identity;
 mod sha256d_self_test;
 mod stats;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
+    body::{to_bytes, Body},
     extract::State,
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -30,6 +31,11 @@ const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
 const LOGIN_HTML: &str = include_str!("../assets/login.html");
 const LOGIN_CSS: &str = include_str!("../assets/login.css");
 const LOGIN_JS: &str = include_str!("../assets/login.js");
+
+const MAX_LOGIN_BODY_BYTES: usize = 1024;
+// Every rejected login pays the same delay. This slows online guessing with
+// no attacker-controlled keys or other growing in-memory state.
+const LOGIN_FAILURE_DELAY: Duration = Duration::from_millis(200);
 
 // Every directive the pages need to work is `'self'` — the HTML ships its
 // styles and scripts as local assets, so no inline/external allowance exists.
@@ -198,7 +204,34 @@ struct LoginBody {
     password: String,
 }
 
-async fn login(State(app): State<SharedApp>, Json(body): Json<LoginBody>) -> Response {
+async fn login(State(app): State<SharedApp>, request: Request<Body>) -> Response {
+    let bytes = match to_bytes(request.into_body(), MAX_LOGIN_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
+            return add_security_headers(
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(serde_json::json!({"error": "login request too large"})),
+                )
+                    .into_response(),
+            );
+        }
+    };
+    let body: LoginBody = match serde_json::from_slice(&bytes) {
+        Ok(body) => body,
+        Err(_) => {
+            tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
+            return add_security_headers(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid login request"})),
+                )
+                    .into_response(),
+            );
+        }
+    };
+
     match app.auth.login(&body.password) {
         Some(_) => add_security_headers(
             (
@@ -208,13 +241,16 @@ async fn login(State(app): State<SharedApp>, Json(body): Json<LoginBody>) -> Res
             )
                 .into_response(),
         ),
-        None => add_security_headers(
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "wrong password"})),
+        None => {
+            tokio::time::sleep(LOGIN_FAILURE_DELAY).await;
+            add_security_headers(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "wrong password"})),
+                )
+                    .into_response(),
             )
-                .into_response(),
-        ),
+        }
     }
 }
 
@@ -373,6 +409,70 @@ mod security_headers_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_security_headers(&response);
+    }
+
+    async fn login_response(app: Router, password: &str) -> Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"password": password}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn login_accepts_correct_password_and_sets_twelve_hour_cookie() {
+        let response = login_response(test_app(Some("hunter2")), "hunter2").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_security_headers(&response);
+        let cookie = response.headers().get(header::SET_COOKIE).unwrap();
+        assert!(cookie.to_str().unwrap().contains("Max-Age=43200"));
+    }
+
+    #[tokio::test]
+    async fn login_rejects_wrong_and_empty_passwords() {
+        for attempt in ["wrong", ""] {
+            let response = login_response(test_app(Some("hunter2")), attempt).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_security_headers(&response);
+        }
+    }
+
+    #[tokio::test]
+    async fn login_rejects_oversized_body() {
+        let oversized = format!(r#"{{"password":"{}"}}"#, "x".repeat(MAX_LOGIN_BODY_BYTES));
+        let response = test_app(Some("hunter2"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_security_headers(&response);
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_logins_are_uniformly_delayed() {
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            let response = login_response(test_app(Some("hunter2")), "wrong").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(
+            started.elapsed() >= LOGIN_FAILURE_DELAY * 3,
+            "every failed attempt must pay the configured delay"
+        );
     }
 
     #[tokio::test]

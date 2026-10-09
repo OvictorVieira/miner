@@ -62,8 +62,8 @@ services:
     # Remote/LAN access is explicitly out of scope in this MVP (see
     # SECURITY.md, US-036). The container-side bind to 0.0.0.0 is safe
     # ONLY because this publication address is 127.0.0.1 — never change
-    # the host side to 0.0.0.0, a LAN IP, or :: without also shipping the
-    # authenticated-session work (US-037..039).
+    # the host side to 0.0.0.0, a LAN IP, or ::. DASHBOARD_PASSWORD below is
+    # local defense in depth and does not make remote exposure safe.
     ports:
       - "127.0.0.1:3500:3500"
     environment:
@@ -79,5 +79,6 @@ services:
       # Mirrors the `cpus:` cap above so the Rust supervisor caps worker
       # threads to the same whole-core budget Docker enforces.
       CPU_LIMIT: ${CPU_LIMIT:-2}
-      # Dashboard password; without it the panel is public read-only
+      # Optional local-dashboard defense in depth. This does NOT make LAN or
+      # internet exposure safe; keep the loopback-only ports mapping above.
       # DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}

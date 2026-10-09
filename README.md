@@ -26,9 +26,10 @@ The dashboard is published on `127.0.0.1:3500` and nothing else. It is reachable
 only from the host that runs the container — not from the LAN, not from another
 host, not from a public IP. Running the binary directly (outside Docker) defaults
 to the same `127.0.0.1` bind and refuses a non-loopback `BIND_ADDRESS` with an
-explicit error. Remote/LAN access is **explicitly out of scope** in this MVP
-until authenticated sessions ship (see `SECURITY.md`). Do not change the host
-side of the port mapping to `0.0.0.0`, a LAN IP, or `::` to work around this.
+explicit error. Remote/LAN access is **explicitly out of scope** in this MVP,
+including when `DASHBOARD_PASSWORD` is set (see `SECURITY.md`). Do not change
+the host side of the port mapping to `0.0.0.0`, a LAN IP, or `::` to work
+around this.
 
 ## Configuration (env)
 
@@ -38,7 +39,14 @@ side of the port mapping to `0.0.0.0`, a LAN IP, or `::` to work around this.
 | `POWER` | `50` | % of CPU cores used by the miner (1-100) |
 | `WORKER_NAME` | `miner` | Worker name shown at the pool: 1-64 ASCII letters, digits, `_`, or `-` |
 | `PORT` | `3500` | Dashboard port |
-| `DASHBOARD_PASSWORD` | — | Dashboard password; without it the panel is public read-only |
+| `DASHBOARD_PASSWORD` | — | Optional local dashboard password; without it the panel is public read-only |
+
+`DASHBOARD_PASSWORD` is defense in depth for the local dashboard, not a safe
+way to expose it to a LAN or the internet. It is supported only with the
+loopback-only publication above. Keep `127.0.0.1:3500:3500` unchanged; the
+password does not provide TLS, multi-user isolation, or remote-access safety.
+Successful sessions expire after at most 12 hours and are cleared whenever the
+container restarts.
 
 ### Advanced (typed, validated; defaults are correct for almost everyone)
 

@@ -20,6 +20,13 @@
 - GPU driver vulnerabilities (if using NVIDIA/AMD backends)
 - Shared kernel namespaces (PID, network, IPC)
 
+## Dashboard Password Scope
+- `DASHBOARD_PASSWORD` is optional defense in depth for the local dashboard
+- It is supported only while Compose publishes the dashboard on host loopback (`127.0.0.1`)
+- A password does not make LAN or internet exposure safe: the MVP has no TLS or multi-user access control
+- Keep the loopback-only port mapping unchanged even when a password is configured
+- Login requests are size-bounded, rejected attempts are delayed, and sessions expire within 12 hours
+
 ## Disposable-VM Recommendation
 For maximum isolation, run the miner in a disposable VM or trusted, minimal host. Avoid running on shared or sensitive infrastructure.
 
