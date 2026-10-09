@@ -9,6 +9,7 @@ mod fake_stratum;
 mod fork_identity_policy;
 mod miner;
 mod payout_identity;
+mod readme_policy;
 mod sha256d_self_test;
 mod stats;
 
