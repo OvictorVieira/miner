@@ -3,61 +3,75 @@ name: docker
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
   pull_request:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
 
+permissions:
+  contents: read
+
 jobs:
   build:
+    name: Build images without publishing
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  tag-release:
+    name: Publish immutable SemVer image
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Validate exact SemVer release tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release tag must be an exact vMAJOR.MINOR.PATCH SemVer" >&2
+            exit 1
+          fi
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
 
-      - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
         id: meta
         with:
           images: ${{ env.IMAGE }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+          tags: type=semver,pattern={{version}}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      # Optional auto-deploy: set the DOKPLOY_WEBHOOK_URL repo secret to the
-      # service's webhook (Dokploy → service → Deployments) and every image
-      # push to main redeploys it automatically. Skipped when unset.
-      - name: Trigger Dokploy redeploy
-        if: github.ref == 'refs/heads/main'
-        env:
-          WEBHOOK: ${{ secrets.DOKPLOY_WEBHOOK_URL }}
-        run: |
-          if [ -n "$WEBHOOK" ]; then
-            curl -fsS -X POST "$WEBHOOK" && echo "redeploy triggered"
-          else
-            echo "DOKPLOY_WEBHOOK_URL not set — skipping"
-          fi

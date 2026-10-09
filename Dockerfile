@@ -32,11 +32,11 @@ WORKDIR /app
 # Dependency cache layer: build an empty main first
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs \
-    && cargo build --release \
+    && cargo build --release --locked \
     && rm -rf src
 COPY src ./src
 COPY assets ./assets
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked
 
 # ── Stage 3: final image ────────────────────────────────────────
 # debian:bookworm-slim — digest reviewed 2026-10-08. Re-pin when upgrading.
