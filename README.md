@@ -168,6 +168,37 @@ cargo test --locked
 cargo run -- --self-test
 ```
 
+## Release verification
+
+From a fresh checkout with Docker running, execute the complete local release
+gate:
+
+```bash
+tests/release_verification.sh
+```
+
+The gate builds a non-shipping verification stage from the pinned Docker
+inputs and runs the fake-Stratum payout-identity flow and dashboard same-origin
+asset policy inside it. It then builds `miner-local:dev`, starts an inert
+service through Compose, inspects the effective loopback publication, numeric
+non-root user, read-only root filesystem, dropped capabilities, and absence of
+mounts, and runs the SHA-256d self-test from the final image with networking
+disabled.
+
+The final real-pool check is intentionally manual because it sends the public
+payout identity and mining shares over plaintext Stratum:
+
+1. Set a checksum-valid `WALLET` and a distinctive safe `WORKER_NAME` in
+   `.env`, then run `docker compose build && docker compose up -d --no-build`.
+2. Leave the miner running for at least 30 minutes. Record the start/end time,
+   image ID (`docker image inspect miner-local:dev --format '{{.Id}}'`), and
+   accepted-share lines from `docker compose logs miner`.
+3. Open `https://web.public-pool.io/#/app/YOUR_WALLET`, confirm the distinctive
+   worker is visible, and record the worker name plus accepted-share count.
+4. Stop the service with `docker compose down`. Treat a missing/mismatched
+   worker or no accepted shares as a failed release check to investigate, not
+   as permission to weaken the payout-identity or network controls.
+
 See [SECURITY.md](SECURITY.md) for the complete threat model and private
 vulnerability-reporting process.
 

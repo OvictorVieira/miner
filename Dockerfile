@@ -38,6 +38,14 @@ COPY src ./src
 COPY assets ./assets
 RUN touch src/main.rs && cargo build --release --locked
 
+# Verification stage (not shipped). Built explicitly by
+# tests/release_verification.sh to run the fake-Stratum identity and browser
+# origin checks against the same locked source tree used for the release binary.
+FROM app-build AS offline-verification
+RUN cargo test --locked payout_identity
+RUN cargo test --locked assets_reference_no_third_party_subresources
+RUN /app/target/release/miner --self-test
+
 # ── Stage 3: final image ────────────────────────────────────────
 # debian:bookworm-slim — digest reviewed 2026-10-08. Re-pin when upgrading.
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587

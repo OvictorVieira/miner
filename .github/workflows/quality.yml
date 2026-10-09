@@ -46,11 +46,11 @@ jobs:
       - name: Run SHA-256d self-test
         run: ./target/release/miner --self-test
 
-  compose-security:
-    name: Compose runtime security inspection
+  release-verification:
+    name: Local release end-to-end verification
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Inspect hardened running container
-        run: tests/compose_security.sh
+      - name: Verify built image and hardened Compose runtime
+        run: tests/release_verification.sh

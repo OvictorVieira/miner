@@ -17,36 +17,36 @@ mod tests {
             .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
     }
 
-    /// Returns every `FROM` image reference found in the file, excluding the
-    /// `AS <alias>` suffix and `--platform` flags.
+    /// Returns every external `FROM` image reference found in the file,
+    /// excluding previously declared stage aliases, `AS <alias>` suffixes,
+    /// and `--platform` flags.
     fn from_references(contents: &str) -> Vec<String> {
-        contents
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim();
-                // Match lines that start with FROM (case-insensitive, to be safe)
-                if !trimmed.to_uppercase().starts_with("FROM ") {
-                    return None;
-                }
-                // Strip the keyword
-                let rest = trimmed[5..].trim();
-                // Strip --platform=... flag if present
-                let rest = if rest.starts_with("--") {
-                    // skip the flag token
-                    rest.split_once(' ').map(|x| x.1).unwrap_or("").trim()
-                } else {
-                    rest
-                };
-                // Strip the " AS <alias>" suffix
-                let image = rest.split_whitespace().next().unwrap_or("").to_string();
-                // Ignore the special "scratch" image — it has no digest
-                if image.eq_ignore_ascii_case("scratch") {
-                    None
-                } else {
-                    Some(image)
-                }
-            })
-            .collect()
+        let mut aliases = Vec::new();
+        let mut references = Vec::new();
+
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if !trimmed.to_uppercase().starts_with("FROM ") {
+                continue;
+            }
+            let rest = trimmed[5..].trim();
+            let rest = if rest.starts_with("--") {
+                rest.split_once(' ').map(|x| x.1).unwrap_or("").trim()
+            } else {
+                rest
+            };
+            let tokens: Vec<_> = rest.split_whitespace().collect();
+            let image = tokens.first().copied().unwrap_or("");
+            let is_stage_alias = aliases.iter().any(|alias| alias == image);
+            if !image.eq_ignore_ascii_case("scratch") && !is_stage_alias {
+                references.push(image.to_string());
+            }
+            if tokens.len() >= 3 && tokens[1].eq_ignore_ascii_case("AS") {
+                aliases.push(tokens[2].to_string());
+            }
+        }
+
+        references
     }
 
     #[test]
@@ -116,5 +116,31 @@ mod tests {
                 "Dockerfile HEALTHCHECK contains forbidden detail {forbidden:?}: {healthcheck}"
             );
         }
+    }
+
+    #[test]
+    fn offline_verification_stage_runs_locked_tests_and_self_test() {
+        let contents = dockerfile_contents();
+        let verification = contents
+            .split_once("FROM app-build AS offline-verification")
+            .and_then(|(_, rest)| {
+                rest.split_once("Stage 3: final image")
+                    .map(|(stage, _)| stage)
+            })
+            .expect("Dockerfile must define an offline-verification stage before the final image");
+
+        for test_filter in [
+            "cargo test --locked payout_identity",
+            "cargo test --locked assets_reference_no_third_party_subresources",
+        ] {
+            assert!(
+                verification.contains(test_filter),
+                "offline verification must run {test_filter}"
+            );
+        }
+        assert!(
+            verification.contains("RUN /app/target/release/miner --self-test"),
+            "offline verification must run the release binary self-test"
+        );
     }
 }
